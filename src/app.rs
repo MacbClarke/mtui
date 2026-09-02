@@ -99,8 +99,8 @@ pub(crate) struct App {
     conn_status: ConnectionStatus,
     /// 待发送到后台的命令（on_key 同步收集，主循环异步发送）
     pending_cmds: Vec<Command>,
-    /// 挂起的命令回执（oneshot 无法跨 await 等待，在主循环轮询）
-    pending_reply: Option<oneshot::Receiver<Result<(), String>>>,
+    /// 挂起的命令回执（oneshot 无法跨 await 等待，在主循环轮询；带发起时间用于超时兜底）
+    pending_reply: Option<(std::time::Instant, oneshot::Receiver<Result<(), String>>)>,
     /// 状态消息：(内容, 是否错误)
     status: Option<(String, bool)>,
     quit: bool,
@@ -163,13 +163,16 @@ impl App {
                 }
             }
 
-            // 4. 命令回执
-            if let Some(rx) = &mut self.pending_reply {
+            // 4. 命令回执（含超时兜底：后台忙碌/卡住时不至于永久显示“处理中”）
+            if let Some((started, rx)) = &mut self.pending_reply {
                 if let Ok(res) = rx.try_recv() {
                     match res {
                         Ok(()) => self.status = Some(("已添加隧道".into(), false)),
                         Err(e) => self.status = Some((e, true)),
                     }
+                    self.pending_reply = None;
+                } else if started.elapsed() > std::time::Duration::from_secs(10) {
+                    self.status = Some(("后台命令超时（连接重连中？），请重试".into(), true));
                     self.pending_reply = None;
                 }
             }
@@ -273,7 +276,7 @@ impl App {
             local_port: t.local_port,
             reply: tx,
         });
-        self.pending_reply = Some(rx);
+        self.pending_reply = Some((std::time::Instant::now(), rx));
         self.status = Some((format!("正在删除隧道 {}…", t.local_port), false));
     }
 
@@ -290,7 +293,7 @@ impl App {
                     remote_port,
                     reply: tx,
                 });
-                self.pending_reply = Some(rx);
+                self.pending_reply = Some((std::time::Instant::now(), rx));
                 self.mode = Mode::List;
                 self.status = Some((format!("正在添加隧道 {local_port}…"), false));
             }

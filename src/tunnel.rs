@@ -115,7 +115,7 @@ pub(crate) struct TunnelManager {
     params: ConnectParams,
     handle: Arc<RwLock<Handle<SshHandler>>>,
     tunnels: HashMap<u16, TunnelEntry>,
-    status: ConnectionStatus,
+    status: Arc<std::sync::Mutex<ConnectionStatus>>,
     /// 速率计算的上一采样点
     last_rx: HashMap<u16, u64>,
     last_tx: HashMap<u16, u64>,
@@ -267,7 +267,7 @@ impl TunnelManager {
             params,
             handle: Arc::new(RwLock::new(handle)),
             tunnels: HashMap::new(),
-            status: ConnectionStatus::Connected,
+            status: Arc::new(std::sync::Mutex::new(ConnectionStatus::Connected)),
             last_rx: HashMap::new(),
             last_tx: HashMap::new(),
             last_sample: Instant::now(),
@@ -275,35 +275,45 @@ impl TunnelManager {
     }
 
     pub(crate) fn status(&self) -> ConnectionStatus {
-        self.status
+        *self.status.lock().unwrap()
     }
 
 
     /// 检测主连接是否断开；若断开则自动重连（指数退避，最多 5 次）
+    /// 检测 SSH 主连接是否断开；若断开则启动后台重连任务（不阻塞调用方）。
+    /// 重连任务串行尝试最多 5 次（指数退避），完成后更新共享状态。
     pub(crate) async fn check_and_reconnect(&mut self) -> ConnectionStatus {
-        if self.status != ConnectionStatus::Connected {
-            return self.status; // 重连中/已离线，交给重连流程
+        let now = self.status();
+        if now != ConnectionStatus::Connected {
+            return now; // 已有重连任务在跑或已离线
         }
         let closed = self.handle.read().await.is_closed();
         if !closed {
-            return self.status;
+            return now;
         }
-        for attempt in 1..=5 {
-            self.status = ConnectionStatus::Reconnecting(attempt);
-            match Self::connect_handle(&self.params).await {
-                Ok(new_handle) => {
-                    *self.handle.write().await = new_handle;
-                    self.status = ConnectionStatus::Connected;
-                    return self.status;
-                }
-                Err(_) => {
-                    let wait = Duration::from_secs(1u64 << attempt.min(4));
-                    tokio::time::sleep(wait).await;
+        // 启动后台重连：命令循环不再被退避 sleep 阻塞
+        *self.status.lock().unwrap() = ConnectionStatus::Reconnecting(0);
+        let params = self.params.clone();
+        let handle = Arc::clone(&self.handle);
+        let status = Arc::clone(&self.status);
+        tokio::spawn(async move {
+            for attempt in 1..=5 {
+                *status.lock().unwrap() = ConnectionStatus::Reconnecting(attempt);
+                match TunnelManager::connect_handle(&params).await {
+                    Ok(new_handle) => {
+                        *handle.write().await = new_handle;
+                        *status.lock().unwrap() = ConnectionStatus::Connected;
+                        return;
+                    }
+                    Err(_) => {
+                        let wait = Duration::from_secs(1u64 << attempt.min(4));
+                        tokio::time::sleep(wait).await;
+                    }
                 }
             }
-        }
-        self.status = ConnectionStatus::Disconnected;
-        self.status
+            *status.lock().unwrap() = ConnectionStatus::Disconnected;
+        });
+        ConnectionStatus::Reconnecting(0)
     }
 
     /// 新增一条隧道：绑定本地端口，启动监听循环
@@ -395,6 +405,7 @@ impl TunnelManager {
 
     /// 优雅断开 SSH 主连接
     pub(crate) async fn shutdown(&mut self) {
+        *self.status.lock().unwrap() = ConnectionStatus::Disconnected;
         for (_port, entry) in self.tunnels.drain() {
             entry.task.abort();
         }
