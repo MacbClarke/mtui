@@ -10,7 +10,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Clear, List, Paragraph, Row, Table};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::tunnel::{Command, ConnectionStatus, Event as TunnelEvent, TunnelInfo};
+use crate::tunnel::{Command, ConnectionStatus, Event as TunnelEvent, RemotePort, TunnelInfo};
 
 /// 界面模式
 enum Mode {
@@ -20,6 +20,8 @@ enum Mode {
     Input,
     /// 查看选中隧道的日志
     Log { port: u16, scroll: usize },
+    /// 远端端口发现面板
+    Ports,
 }
 
 /// 新增表单：两个字段（本地端口 / 远端 host:port）
@@ -101,6 +103,11 @@ pub(crate) struct App {
     pending_cmds: Vec<Command>,
     /// 挂起的命令回执（oneshot 无法跨 await 等待，在主循环轮询；带发起时间用于超时兜底）
     pending_reply: Option<(std::time::Instant, oneshot::Receiver<Result<(), String>>)>,
+    /// 挂起的远端端口扫描回执
+    pending_scan: Option<oneshot::Receiver<Vec<RemotePort>>>,
+    /// 远端端口发现结果
+    remote_ports: Vec<RemotePort>,
+    ports_selected: usize,
     /// 状态消息：(内容, 是否错误)
     status: Option<(String, bool)>,
     quit: bool,
@@ -120,6 +127,9 @@ impl App {
             form: Form::new(),
             pending_cmds: Vec::new(),
             pending_reply: None,
+            pending_scan: None,
+            remote_ports: Vec::new(),
+            ports_selected: 0,
             status: None,
             conn_status: ConnectionStatus::Connected,
             quit: false,
@@ -160,6 +170,14 @@ impl App {
             for cmd in self.pending_cmds.drain(..) {
                 if self.cmd_tx.send(cmd).await.is_err() {
                     self.status = Some(("后台任务已退出".into(), true));
+                }
+            }
+
+            // 3.5 端口扫描回执
+            if let Some(rx) = &mut self.pending_scan {
+                if let Ok(ports) = rx.try_recv() {
+                    self.remote_ports = ports;
+                    self.pending_scan = None;
                 }
             }
 
@@ -205,6 +223,12 @@ impl App {
                         self.status = None;
                     }
                 }
+                KeyCode::Char('p') => {
+                    self.mode = Mode::Ports;
+                    self.ports_selected = 0;
+                    self.status = None;
+                    self.refresh_ports();
+                }
                 _ => {}
             }
             Mode::Log { port, scroll } => {
@@ -232,6 +256,29 @@ impl App {
                     self.mode = Mode::List;
                 } else {
                     self.mode = Mode::Log { port, scroll: new_scroll };
+                }
+            }
+            Mode::Ports => {
+                let mut action = None;
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if !self.remote_ports.is_empty() {
+                            self.ports_selected = (self.ports_selected + 1)
+                                .min(self.remote_ports.len() - 1);
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.ports_selected = self.ports_selected.saturating_sub(1);
+                    }
+                    KeyCode::Char('r') => self.refresh_ports(),
+                    KeyCode::Enter => action = Some(self.ports_selected),
+                    KeyCode::Char('q') | KeyCode::Esc => self.mode = Mode::List,
+                    _ => {}
+                }
+                if let Some(idx) = action {
+                    if let Some(rp) = self.remote_ports.get(idx).cloned() {
+                        self.add_tunnel_from_port(&rp);
+                    }
                 }
             }
             Mode::Input => match key.code {
@@ -278,6 +325,44 @@ impl App {
         });
         self.pending_reply = Some((std::time::Instant::now(), rx));
         self.status = Some((format!("正在删除隧道 {}…", t.local_port), false));
+    }
+
+    /// 请求一次远端端口扫描
+    fn refresh_ports(&mut self) {
+        let (tx, rx) = oneshot::channel();
+        self.pending_cmds.push(Command::ScanPorts { reply: tx });
+        self.pending_scan = Some(rx);
+        self.status = Some(("正在扫描远端端口…".into(), false));
+    }
+
+    /// 探测本地端口是否空闲（bind 测试，立即释放）
+    fn port_free(port: u16) -> bool {
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+    }
+
+    /// 从端口面板创建隧道：本地端口优先等于远端端口，被占用则向上递进
+    fn add_tunnel_from_port(&mut self, rp: &RemotePort) {
+        let mut local = rp.port;
+        while !Self::port_free(local) && local < 65535 {
+            local += 1;
+        }
+        let (tx, rx) = oneshot::channel();
+        self.pending_cmds.push(Command::Add {
+            local_port: local,
+            remote_host: "localhost".to_string(),
+            remote_port: rp.port as u32,
+            reply: tx,
+        });
+        self.pending_reply = Some((std::time::Instant::now(), rx));
+        let hint = if local == rp.port {
+            String::new()
+        } else {
+            format!("（本地 {local} 已被占用，使用 {local}）")
+        };
+        self.status = Some((
+            format!("正在添加隧道 {local} -> localhost:{} {hint}", rp.port),
+            false,
+        ));
     }
 
     fn submit_form(&mut self) {
@@ -373,7 +458,7 @@ impl App {
         );
 
         // 隧道列表（Log 模式下不渲染，避免与日志面板重叠）
-        if !matches!(self.mode, Mode::Log { .. }) {
+        if !matches!(self.mode, Mode::Log { .. } | Mode::Ports) {
             let rows: Vec<Row> = self
                 .tunnels
                 .iter()
@@ -415,7 +500,7 @@ impl App {
         match self.mode {
             Mode::List => {
                 let help = format!(
-                    " [a]新增  [d]删除  [l]日志  [↑/↓]选择  [q]退出    共 {} 条隧道",
+                    " [a]新增  [d]删除  [l]日志  [p]端口  [↑/↓]选择  [q]退出    共 {} 条隧道",
                     self.tunnels.len()
                 );
                 f.render_widget(
@@ -444,6 +529,56 @@ impl App {
                 let help = format!(
                     " [↑/↓]滚动  [g/G]首/尾  [q]返回    共 {} 条",
                     log.len()
+                );
+                f.render_widget(
+                    Paragraph::new(help).style(Style::new().fg(Color::DarkGray)),
+                    footer,
+                );
+            }
+            Mode::Ports => {
+                if self.remote_ports.is_empty() {
+                    f.render_widget(
+                        Paragraph::new("正在扫描远端监听端口…（无结果时按 r 刷新）")
+                            .block(Block::new().borders(Borders::ALL).title(" 远端端口 "))
+                            .style(Style::new().fg(Color::DarkGray)),
+                        list,
+                    );
+                } else {
+                    let rows: Vec<Row> = self
+                        .remote_ports
+                        .iter()
+                        .enumerate()
+                        .map(|(_i, p)| {
+                            let mapped = self
+                                .tunnels
+                                .iter()
+                                .any(|t| t.local_port == p.port || t.remote_port == p.port as u32);
+                            let status = if mapped { "已映射" } else { "" };
+                            Row::new(vec![
+                                Cell::from(p.port.to_string()),
+                                Cell::from(p.process.clone()),
+                                Cell::from(status),
+                            ])
+                        })
+                        .collect();
+                    let table = Table::new(
+                        rows,
+                        [
+                            Constraint::Length(10),
+                            Constraint::Length(30),
+                            Constraint::Length(10),
+                        ],
+                    )
+                    .header(Row::new(vec!["端口", "进程", "状态"]))
+                    .block(Block::new().borders(Borders::ALL).title(" 远端端口 "))
+                    .row_highlight_style(Style::new().fg(Color::Black).bg(Color::Cyan).bold());
+                    let mut state = ratatui::widgets::TableState::new()
+                        .with_selected(Some(self.ports_selected));
+                    f.render_stateful_widget(table, list, &mut state);
+                }
+                let help = format!(
+                    " [Enter]转发  [r]重新扫描  [↑/↓]选择  [q]返回    共 {} 个端口",
+                    self.remote_ports.len()
                 );
                 f.render_widget(
                     Paragraph::new(help).style(Style::new().fg(Color::DarkGray)),
@@ -491,7 +626,7 @@ impl App {
                 );
                 // 帮助栏保持可见
                 let help = format!(
-                    " [a]新增  [d]删除  [l]日志  [↑/↓]选择  [q]退出    共 {} 条隧道",
+                    " [a]新增  [d]删除  [l]日志  [p]端口  [↑/↓]选择  [q]退出    共 {} 条隧道",
                     self.tunnels.len()
                 );
                 f.render_widget(

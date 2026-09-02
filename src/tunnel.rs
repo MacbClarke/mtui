@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use russh::client::{self, Handle};
 use russh::keys::known_hosts::check_known_hosts;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+use russh::ChannelMsg;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
@@ -108,6 +109,13 @@ pub(crate) struct TunnelInfo {
     pub tx_rate: u64,
     /// 该隧道的事件日志（旧→新）
     pub log: Vec<String>,
+}
+
+/// 远端发现的监听端口
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemotePort {
+    pub port: u16,
+    pub process: String,
 }
 
 /// 隧道控制中心：持有 SSH 主连接句柄 + 隧道表
@@ -453,6 +461,10 @@ pub(crate) enum Command {
         local_port: u16,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// 扫描远端监听端口（VSCode 式端口发现）
+    ScanPorts {
+        reply: tokio::sync::oneshot::Sender<Vec<RemotePort>>,
+    },
     Quit,
 }
 
@@ -490,6 +502,10 @@ pub(crate) async fn manager_loop(
                         let r = mgr.remove(local_port).await;
                         let _ = reply.send(r);
                     }
+                    Command::ScanPorts { reply } => {
+                        let ports = scan_remote_ports(&mgr.handle).await;
+                        let _ = reply.send(ports);
+                    }
                     Command::Quit => break,
                 }
                 let _ = events.send(Event::State { status: mgr.status(), tunnels: mgr.list() });
@@ -497,4 +513,134 @@ pub(crate) async fn manager_loop(
         }
     }
     mgr.shutdown().await;
+}
+// ---------- 远端端口发现 ----------
+
+/// 在远端执行 `ss -tln`（fallback: netstat -tln），解析监听端口列表。
+/// 失败时返回空列表。
+pub(crate) async fn scan_remote_ports(
+    handle: &RwLock<Handle<SshHandler>>,
+) -> Vec<RemotePort> {
+    let mut channel = {
+        let h = handle.read().await;
+        match h.channel_open_session().await {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        }
+    };
+    let cmd = "ss -tln 2>/dev/null || netstat -tln 2>/dev/null";
+    if channel.exec(true, cmd).await.is_err() {
+        return Vec::new();
+    }
+    let mut output = Vec::new();
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => output.extend_from_slice(&data),
+            Some(ChannelMsg::ExtendedData { data, .. }) => output.extend_from_slice(&data),
+            Some(ChannelMsg::Eof) => break,
+            Some(_) => {}
+            None => break,
+        }
+    }
+    parse_listen_ports(&String::from_utf8_lossy(&output))
+}
+
+/// 解析 `ss -tln` / `netstat -tln` 输出中的 LISTEN 端口与进程名
+fn parse_listen_ports(output: &str) -> Vec<RemotePort> {
+    let mut ports = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if !line.contains("LISTEN") {
+            continue;
+        }
+        // 进程名：ss 的 users:(("name",pid=..)) 或 netstat 的 pid/name
+        let process = extract_process(line);
+        // 端口：Local Address 列（第 4 个空白分隔字段）最后一个 ':' 后的数字
+        let port = match line.split_whitespace().nth(3) {
+            Some(local) => match local.rfind(':') {
+                Some(i) => {
+                    let digits: String = local[i + 1..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    digits.parse::<u16>().ok()
+                }
+                None => None,
+            },
+            None => None,
+        };
+        if let Some(port) = port {
+            if port > 0 && !ports.iter().any(|p: &RemotePort| p.port == port) {
+                ports.push(RemotePort { port, process });
+            }
+        }
+    }
+    ports.sort_by_key(|p| p.port);
+    ports
+}
+
+fn extract_process(line: &str) -> String {
+    // ss: users:(("sshd",pid=123,fd=4))
+    if let Some(idx) = line.find("((\"") {
+        let rest = &line[idx + 3..];
+        if let Some(end) = rest.find('"') {
+            return rest[..end].to_string();
+        }
+    }
+    // netstat: 1234/sshd  （行尾 pid/name）
+    if let Some(idx) = line.find("LISTEN") {
+        let tail = line[idx + 6..].trim();
+        if let Some(slash) = tail.find('/') {
+            let name: String = tail[slash + 1..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ss_output() {
+        let out = "\
+State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+LISTEN 0      128    0.0.0.0:22          0.0.0.0:*       users:((\"sshd\",pid=123,fd=3))
+LISTEN 0      511    127.0.0.1:8848      0.0.0.0:*       users:((\"python3\",pid=456,fd=5))
+LISTEN 0      5      127.0.0.1:8000      0.0.0.0:*       users:((\"python3\",pid=789,fd=3))
+";
+        let ports = parse_listen_ports(out);
+        assert_eq!(ports.len(), 3);
+        assert_eq!(ports[0], RemotePort { port: 22, process: "sshd".into() });
+        assert_eq!(ports[1], RemotePort { port: 8000, process: "python3".into() });
+        assert_eq!(ports[2], RemotePort { port: 8848, process: "python3".into() });
+    }
+
+    #[test]
+    fn parse_netstat_output() {
+        let out = "\
+Active Internet connections (only servers)
+Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name
+tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN      123/sshd
+tcp        0      0 127.0.0.1:631           0.0.0.0:*               LISTEN      456/cupsd
+";
+        let ports = parse_listen_ports(out);
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0], RemotePort { port: 22, process: "sshd".into() });
+        assert_eq!(ports[1], RemotePort { port: 631, process: "cupsd".into() });
+    }
+
+    #[test]
+    fn dedup_and_sort() {
+        let out = "LISTEN 0 1 0.0.0.0:80 0.0.0.0:* users:((\"a\",pid=1))\n\
+                    LISTEN 0 1 0.0.0.0:80 0.0.0.0:* users:((\"b\",pid=2))\n\
+                    LISTEN 0 1 0.0.0.0:22 0.0.0.0:* users:((\"c\",pid=3))\n";
+        let ports = parse_listen_ports(out);
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].port, 22);
+        assert_eq!(ports[1].port, 80);
+    }
 }
