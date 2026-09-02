@@ -1,0 +1,9 @@
+[package]
+name = "mtui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+russh = "0.63"
+tokio = { version = "1", features = ["macros", "net", "io-util", "rt-multi-thread", "sync"] }
