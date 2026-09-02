@@ -120,6 +120,8 @@ pub(crate) struct TunnelManager {
     last_rx: HashMap<u16, u64>,
     last_tx: HashMap<u16, u64>,
     last_sample: Instant,
+    /// 上次 keepalive 探测时间（闲置时维持连接活性并检测半开断链）
+    last_keepalive: Instant,
 }
 
 /// 单个转发连接的中继：锁内只做 channel open 并切分读写半，
@@ -271,6 +273,7 @@ impl TunnelManager {
             last_rx: HashMap::new(),
             last_tx: HashMap::new(),
             last_sample: Instant::now(),
+            last_keepalive: Instant::now(),
         })
     }
 
@@ -287,7 +290,25 @@ impl TunnelManager {
         if now != ConnectionStatus::Connected {
             return now; // 已有重连任务在跑或已离线
         }
-        let closed = self.handle.read().await.is_closed();
+        // 30s 一次的存活探测：空闲时维持连接活跃，半开断链时能感知
+        let need_probe = self.last_keepalive.elapsed() >= Duration::from_secs(30);
+        if need_probe {
+            self.last_keepalive = Instant::now();
+        }
+        let closed = {
+            let handle = self.handle.read().await;
+            if handle.is_closed() {
+                true
+            } else if need_probe {
+                // ping 带 10s 超时：失败视为连接已死（半开连接）
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(10), handle.send_ping()).await,
+                    Err(_) | Ok(Err(_))
+                )
+            } else {
+                false
+            }
+        };
         if !closed {
             return now;
         }
