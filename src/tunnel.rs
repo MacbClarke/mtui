@@ -209,7 +209,10 @@ impl TunnelManager {
             .map_err(|e| format!("加载私钥 {} 失败：{e}", params.key_path.display()))?;
         let key = Arc::new(key);
 
-        let config = Arc::new(client::Config::default());
+        let config = Arc::new(client::Config {
+            nodelay: true,
+            ..Default::default()
+        });
         let mut session = client::connect(
             config,
             (params.host.as_str(), params.ssh_port),
