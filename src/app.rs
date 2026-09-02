@@ -1,4 +1,4 @@
-//! TUI 界面：隧道列表视图 + 键盘交互（新增/删除/选择）+ 输入表单。
+//! TUI 界面：隧道列表视图 + 键盘交互（新增/删除/选择）+ 统一美观的新建隧道与端口发现弹窗。
 //! 与 TunnelManager 解耦：指令走 mpsc，状态回报走快照事件。
 
 use std::io;
@@ -7,7 +7,9 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Constraint::{Length, Min};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Clear, List, Paragraph, Row, Table};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, List, Paragraph, Row, Table, TableState,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::tunnel::{Command, ConnectionStatus, Event as TunnelEvent, RemotePort, TunnelInfo};
@@ -16,17 +18,26 @@ use crate::tunnel::{Command, ConnectionStatus, Event as TunnelEvent, RemotePort,
 enum Mode {
     /// 列表浏览
     List,
-    /// 新增隧道表单
+    /// 新增隧道表单（内嵌远端服务自动发现与快速选择）
     Input,
     /// 查看选中隧道的日志
     Log { port: u16, scroll: usize },
-    /// 远端端口发现面板
-    Ports,
 }
 
-/// 新增表单：两个字段（本地端口 / 远端 host:port）
+/// 新增表单焦点位置
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FormFocus {
+    /// 本地端口输入
+    LocalPort,
+    /// 远端目标输入
+    RemoteTarget,
+    /// 远端发现服务列表
+    RemoteList,
+}
+
+/// 新增表单状态
 struct Form {
-    field: usize,
+    focus: FormFocus,
     local_port: String,
     remote: String,
 }
@@ -34,17 +45,9 @@ struct Form {
 impl Form {
     fn new() -> Self {
         Self {
-            field: 0,
+            focus: FormFocus::LocalPort,
             local_port: String::new(),
             remote: String::new(),
-        }
-    }
-
-    fn current(&mut self) -> &mut String {
-        if self.field == 0 {
-            &mut self.local_port
-        } else {
-            &mut self.remote
         }
     }
 
@@ -177,6 +180,12 @@ impl App {
             if let Some(rx) = &mut self.pending_scan {
                 if let Ok(ports) = rx.try_recv() {
                     self.remote_ports = ports;
+                    if !self.remote_ports.is_empty() {
+                        self.ports_selected =
+                            self.ports_selected.min(self.remote_ports.len() - 1);
+                    } else {
+                        self.ports_selected = 0;
+                    }
                     self.pending_scan = None;
                 }
             }
@@ -185,7 +194,7 @@ impl App {
             if let Some((started, rx)) = &mut self.pending_reply {
                 if let Ok(res) = rx.try_recv() {
                     match res {
-                        Ok(()) => self.status = Some(("已添加隧道".into(), false)),
+                        Ok(()) => self.status = Some(("已成功创建隧道".into(), false)),
                         Err(e) => self.status = Some((e, true)),
                     }
                     self.pending_reply = None;
@@ -213,24 +222,30 @@ impl App {
                     self.mode = Mode::Input;
                     self.form = Form::new();
                     self.status = None;
+                    self.refresh_ports();
+                }
+                KeyCode::Char('p') => {
+                    // 兼容习惯：直接打开新建弹窗并聚焦到远端服务列表
+                    self.mode = Mode::Input;
+                    self.form = Form::new();
+                    self.form.focus = FormFocus::RemoteList;
+                    self.status = None;
+                    self.refresh_ports();
                 }
                 KeyCode::Char('d') | KeyCode::Delete => self.remove_selected(),
                 KeyCode::Char('j') | KeyCode::Down => self.select(1),
                 KeyCode::Char('k') | KeyCode::Up => self.select(-1),
                 KeyCode::Char('l') => {
                     if let Some(t) = self.tunnels.get(self.selected) {
-                        self.mode = Mode::Log { port: t.local_port, scroll: 0 };
+                        self.mode = Mode::Log {
+                            port: t.local_port,
+                            scroll: 0,
+                        };
                         self.status = None;
                     }
                 }
-                KeyCode::Char('p') => {
-                    self.mode = Mode::Ports;
-                    self.ports_selected = 0;
-                    self.status = None;
-                    self.refresh_ports();
-                }
                 _ => {}
-            }
+            },
             Mode::Log { port, scroll } => {
                 let mut new_scroll = scroll;
                 let mut back = false;
@@ -255,54 +270,140 @@ impl App {
                 if back {
                     self.mode = Mode::List;
                 } else {
-                    self.mode = Mode::Log { port, scroll: new_scroll };
+                    self.mode = Mode::Log {
+                        port,
+                        scroll: new_scroll,
+                    };
                 }
             }
-            Mode::Ports => {
-                let mut action = None;
+            Mode::Input => {
+                let has_ports = !self.remote_ports.is_empty();
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if !self.remote_ports.is_empty() {
-                            self.ports_selected = (self.ports_selected + 1)
-                                .min(self.remote_ports.len() - 1);
+                    KeyCode::Esc => {
+                        self.mode = Mode::List;
+                        self.status = None;
+                    }
+                    KeyCode::Tab => {
+                        self.form.focus = match self.form.focus {
+                            FormFocus::LocalPort => FormFocus::RemoteTarget,
+                            FormFocus::RemoteTarget => {
+                                if has_ports {
+                                    FormFocus::RemoteList
+                                } else {
+                                    FormFocus::LocalPort
+                                }
+                            }
+                            FormFocus::RemoteList => FormFocus::LocalPort,
+                        };
+                    }
+                    KeyCode::BackTab => {
+                        self.form.focus = match self.form.focus {
+                            FormFocus::LocalPort => {
+                                if has_ports {
+                                    FormFocus::RemoteList
+                                } else {
+                                    FormFocus::RemoteTarget
+                                }
+                            }
+                            FormFocus::RemoteTarget => FormFocus::LocalPort,
+                            FormFocus::RemoteList => FormFocus::RemoteTarget,
+                        };
+                    }
+                    KeyCode::Down => match self.form.focus {
+                        FormFocus::LocalPort => self.form.focus = FormFocus::RemoteTarget,
+                        FormFocus::RemoteTarget => {
+                            if has_ports {
+                                self.form.focus = FormFocus::RemoteList;
+                            }
+                        }
+                        FormFocus::RemoteList => {
+                            if has_ports {
+                                self.ports_selected =
+                                    (self.ports_selected + 1).min(self.remote_ports.len() - 1);
+                            }
+                        }
+                    },
+                    KeyCode::Up => match self.form.focus {
+                        FormFocus::LocalPort => {}
+                        FormFocus::RemoteTarget => self.form.focus = FormFocus::LocalPort,
+                        FormFocus::RemoteList => {
+                            if self.ports_selected == 0 {
+                                self.form.focus = FormFocus::RemoteTarget;
+                            } else {
+                                self.ports_selected = self.ports_selected.saturating_sub(1);
+                            }
+                        }
+                    },
+                    KeyCode::Char('j') if self.form.focus == FormFocus::RemoteList => {
+                        if has_ports {
+                            self.ports_selected =
+                                (self.ports_selected + 1).min(self.remote_ports.len() - 1);
                         }
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        self.ports_selected = self.ports_selected.saturating_sub(1);
+                    KeyCode::Char('k') if self.form.focus == FormFocus::RemoteList => {
+                        if self.ports_selected == 0 {
+                            self.form.focus = FormFocus::RemoteTarget;
+                        } else {
+                            self.ports_selected = self.ports_selected.saturating_sub(1);
+                        }
                     }
-                    KeyCode::Char('r') => self.refresh_ports(),
-                    KeyCode::Enter => action = Some(self.ports_selected),
-                    KeyCode::Char('q') | KeyCode::Esc => self.mode = Mode::List,
+                    KeyCode::Char('r') | KeyCode::Char('R')
+                        if self.form.focus == FormFocus::RemoteList =>
+                    {
+                        self.refresh_ports();
+                    }
+                    KeyCode::Char(' ') if self.form.focus == FormFocus::RemoteList => {
+                        if let Some(rp) = self.remote_ports.get(self.ports_selected).cloned() {
+                            self.fill_form_from_port(&rp);
+                        }
+                    }
+                    KeyCode::Enter => match self.form.focus {
+                        FormFocus::LocalPort => {
+                            if self.form.local_port.trim().is_empty() {
+                                if has_ports {
+                                    self.form.focus = FormFocus::RemoteList;
+                                } else {
+                                    self.form.focus = FormFocus::RemoteTarget;
+                                }
+                            } else if self.form.remote.trim().is_empty() {
+                                // 本地端口已填且远端留空 -> 直接以 localhost:本地端口 提交
+                                self.submit_form();
+                            } else {
+                                self.submit_form();
+                            }
+                        }
+                        FormFocus::RemoteTarget => {
+                            self.submit_form();
+                        }
+                        FormFocus::RemoteList => {
+                            if let Some(rp) = self.remote_ports.get(self.ports_selected).cloned() {
+                                self.add_tunnel_from_port(&rp);
+                            }
+                        }
+                    },
+                    KeyCode::Backspace => match self.form.focus {
+                        FormFocus::LocalPort => {
+                            self.form.local_port.pop();
+                        }
+                        FormFocus::RemoteTarget => {
+                            self.form.remote.pop();
+                        }
+                        FormFocus::RemoteList => {}
+                    },
+                    KeyCode::Char(c) => match self.form.focus {
+                        FormFocus::LocalPort => {
+                            if c.is_ascii_digit() {
+                                self.form.local_port.push(c);
+                            }
+                        }
+                        FormFocus::RemoteTarget => {
+                            self.form.remote.push(c);
+                        }
+                        FormFocus::RemoteList => {}
+                    },
                     _ => {}
                 }
-                if let Some(idx) = action {
-                    if let Some(rp) = self.remote_ports.get(idx).cloned() {
-                        self.add_tunnel_from_port(&rp);
-                    }
-                }
             }
-            Mode::Input => match key.code {
-                KeyCode::Char(c) => self.form.current().push(c),
-                KeyCode::Backspace => {
-                    self.form.current().pop();
-                }
-                KeyCode::Tab => self.form.field = 1 - self.form.field,
-                KeyCode::Enter => {
-                    if self.form.field == 0 && self.form.remote.trim().is_empty() {
-                        // 只填了本地端口：远端默认 localhost:本地端口，直接提交
-                        self.submit_form();
-                    } else if self.form.field == 0 {
-                        self.form.field = 1;
-                    } else {
-                        self.submit_form();
-                    }
-                }
-                KeyCode::Esc => {
-                    self.mode = Mode::List;
-                    self.status = None;
-                }
-                _ => {}
-            },
         }
     }
 
@@ -332,7 +433,6 @@ impl App {
         let (tx, rx) = oneshot::channel();
         self.pending_cmds.push(Command::ScanPorts { reply: tx });
         self.pending_scan = Some(rx);
-        self.status = Some(("正在扫描远端端口…".into(), false));
     }
 
     /// 探测本地端口是否空闲（bind 测试，立即释放）
@@ -340,7 +440,7 @@ impl App {
         std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
     }
 
-    /// 从端口面板创建隧道：本地端口优先等于远端端口，被占用则向上递进
+    /// 从端口列表一键创建隧道：本地端口优先等于远端端口，被占用则向上递增寻找
     fn add_tunnel_from_port(&mut self, rp: &RemotePort) {
         let mut local = rp.port;
         while !Self::port_free(local) && local < 65535 {
@@ -357,12 +457,38 @@ impl App {
         let hint = if local == rp.port {
             String::new()
         } else {
-            format!("（本地 {local} 已被占用，使用 {local}）")
+            format!("（本地端口已被占用，自动分配为 {}）", local)
         };
+        self.mode = Mode::List;
         self.status = Some((
             format!("正在添加隧道 {local} -> localhost:{} {hint}", rp.port),
             false,
         ));
+    }
+
+    /// 将选中的远端服务填入表单，供用户按需微调本地端口
+    fn fill_form_from_port(&mut self, rp: &RemotePort) {
+        let mut local = rp.port;
+        while !Self::port_free(local) && local < 65535 {
+            local += 1;
+        }
+        self.form.local_port = local.to_string();
+        self.form.remote = format!("localhost:{}", rp.port);
+        self.form.focus = FormFocus::LocalPort;
+        if local != rp.port {
+            self.status = Some((
+                format!(
+                    "已自动填入端口 {}（原本地端口已被占用，已推荐可用端口 {}）",
+                    rp.port, local
+                ),
+                false,
+            ));
+        } else {
+            self.status = Some((
+                format!("已自动填入端口 {}，可按需修改本地端口后回车提交", rp.port),
+                false,
+            ));
+        }
     }
 
     fn submit_form(&mut self) {
@@ -419,23 +545,27 @@ impl App {
                 format!("◐ 重连中(第{n}次)…"),
                 Style::new().fg(Color::Yellow).bold(),
             ),
-            ConnectionStatus::Disconnected => ("○ 已断开".into(), Style::new().fg(Color::Red).bold()),
+            ConnectionStatus::Disconnected => {
+                ("○ 已断开".into(), Style::new().fg(Color::Red).bold())
+            }
         }
     }
 
     fn draw(&mut self, f: &mut Frame) {
-        // 居中弹窗区域计算：输入弹窗用
+        // 居中弹窗区域计算
         fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-            let x = area.x + area.width.saturating_sub(width) / 2;
-            let y = area.y + area.height.saturating_sub(height) / 2;
-            Rect::new(x, y, width.min(area.width), height.min(area.height))
+            let w = width.min(area.width.saturating_sub(2));
+            let h = height.min(area.height.saturating_sub(2));
+            let x = area.x + area.width.saturating_sub(w) / 2;
+            let y = area.y + area.height.saturating_sub(h) / 2;
+            Rect::new(x, y, w, h)
         }
 
         let [header, list, footer] =
             Layout::vertical([Length(3), Min(0), Length(3)]).areas(f.area());
 
         // 标题栏：进程名 + 连接状态 + 状态消息
-        let mut title = " mtui — SSH 隧道 ".to_string();
+        let mut title = " mtui — SSH 动态隧道管理 ".to_string();
         let mut border_style = Style::default();
         let (banner, banner_style) = self.status_banner();
         border_style = border_style.patch(banner_style);
@@ -453,12 +583,13 @@ impl App {
             Block::new()
                 .title(title)
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(border_style),
             header,
         );
 
         // 隧道列表（Log 模式下不渲染，避免与日志面板重叠）
-        if !matches!(self.mode, Mode::Log { .. } | Mode::Ports) {
+        if !matches!(self.mode, Mode::Log { .. }) {
             let rows: Vec<Row> = self
                 .tunnels
                 .iter()
@@ -486,21 +617,29 @@ impl App {
                     Constraint::Length(10),
                 ],
             )
-            .header(Row::new(vec![
-                "本地端口", "远端目标", "连接", "↓速率", "↑速率", "↓累计", "↑累计",
-            ]))
-            .block(Block::new().borders(Borders::ALL).title(" 隧道 "))
+            .header(
+                Row::new(vec![
+                    "本地端口", "远端目标", "连接", "↓速率", "↑速率", "↓累计", "↑累计",
+                ])
+                .style(Style::new().fg(Color::White).bold()),
+            )
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" 活跃隧道 (Active Tunnels) "),
+            )
             .row_highlight_style(Style::new().fg(Color::Black).bg(Color::Cyan).bold());
             let mut state = ratatui::widgets::TableState::new()
                 .with_selected(Some(self.selected));
             f.render_stateful_widget(table, list, &mut state);
         }
 
-        // 底栏：帮助 / 输入表单 / 日志操作提示
+        // 底栏帮助 / 日志视图
         match self.mode {
             Mode::List => {
                 let help = format!(
-                    " [a]新增  [d]删除  [l]日志  [p]端口  [↑/↓]选择  [q]退出    共 {} 条隧道",
+                    " [a]新建/发现  [d]删除  [l]日志  [↑/↓]选择  [q]退出    共 {} 条隧道",
                     self.tunnels.len()
                 );
                 f.render_widget(
@@ -509,10 +648,9 @@ impl App {
                 );
             }
             Mode::Log { port, scroll } => {
-                let tunnel: Option<&TunnelInfo> = self.tunnels.iter().find(|t| t.local_port == port);
-                let log: Vec<String> = tunnel
-                    .map(|t| t.log.clone())
-                    .unwrap_or_default();
+                let tunnel: Option<&TunnelInfo> =
+                    self.tunnels.iter().find(|t| t.local_port == port);
+                let log: Vec<String> = tunnel.map(|t| t.log.clone()).unwrap_or_default();
                 let lines: Vec<ratatui::widgets::ListItem> = log
                     .iter()
                     .skip(scroll)
@@ -522,12 +660,13 @@ impl App {
                     List::new(lines).block(
                         Block::new()
                             .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
                             .title(format!(" 隧道 {port} 日志 ")),
                     ),
                     list,
                 );
                 let help = format!(
-                    " [↑/↓]滚动  [g/G]首/尾  [q]返回    共 {} 条",
+                    " [↑/↓]滚动  [g/G]首/尾  [q/Esc]返回    共 {} 条",
                     log.len()
                 );
                 f.render_widget(
@@ -535,103 +674,263 @@ impl App {
                     footer,
                 );
             }
-            Mode::Ports => {
+            Mode::Input => {
+                // 保持主底栏提示
+                let help = format!(
+                    " [a]新建/发现  [d]删除  [l]日志  [↑/↓]选择  [q]退出    共 {} 条隧道",
+                    self.tunnels.len()
+                );
+                f.render_widget(
+                    Paragraph::new(help).style(Style::new().fg(Color::DarkGray)),
+                    footer,
+                );
+
+                // 居中弹窗：新建隧道 & 远端服务发现
+                let popup = centered_rect(76, 18, f.area());
+                f.render_widget(Clear, popup);
+
+                let modal_block = Block::new()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" ➕ 新建 SSH 端口转发 / 隧道 ")
+                    .title_style(Style::new().fg(Color::Cyan).bold())
+                    .border_style(Style::new().fg(Color::Cyan));
+                f.render_widget(modal_block.clone(), popup);
+
+                let inner = modal_block.inner(popup);
+                let [form_section, ports_section, hint_section] = Layout::vertical([
+                    Length(4), // 表单输入区
+                    Min(8),    // 远端服务列表区
+                    Length(2), // 底部操作提示区
+                ])
+                .areas(inner);
+
+                // --- 1. 表单输入区 ---
+                let [local_line, remote_line, _space] =
+                    Layout::vertical([Length(1), Length(1), Length(1)]).areas(form_section);
+
+                let local_focused = self.form.focus == FormFocus::LocalPort;
+                let local_prefix = if local_focused {
+                    "▶ 本地监听端口: "
+                } else {
+                    "  本地监听端口: "
+                };
+                let local_val = if self.form.local_port.is_empty() {
+                    if local_focused {
+                        "█".to_string()
+                    } else {
+                        "（必填，例如 8080）".to_string()
+                    }
+                } else if local_focused {
+                    format!("{}█", self.form.local_port)
+                } else {
+                    self.form.local_port.clone()
+                };
+                let local_val_style = if local_focused {
+                    Style::new().fg(Color::Black).bg(Color::Cyan).bold()
+                } else if self.form.local_port.is_empty() {
+                    Style::new().fg(Color::DarkGray)
+                } else {
+                    Style::new().fg(Color::White).bold()
+                };
+                let local_widget = Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        local_prefix,
+                        if local_focused {
+                            Style::new().fg(Color::Cyan).bold()
+                        } else {
+                            Style::new().fg(Color::Gray)
+                        },
+                    ),
+                    Span::styled(format!(" {local_val} "), local_val_style),
+                    Span::styled(
+                        "   (本机监听并转发流量的端口)",
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                ]));
+                f.render_widget(local_widget, local_line);
+
+                let remote_focused = self.form.focus == FormFocus::RemoteTarget;
+                let remote_prefix = if remote_focused {
+                    "▶ 远端目标服务: "
+                } else {
+                    "  远端目标服务: "
+                };
+                let remote_val = if self.form.remote.is_empty() {
+                    if remote_focused {
+                        "█".to_string()
+                    } else {
+                        "（留空默认 localhost:本地端口）".to_string()
+                    }
+                } else if remote_focused {
+                    format!("{}█", self.form.remote)
+                } else {
+                    self.form.remote.clone()
+                };
+                let remote_val_style = if remote_focused {
+                    Style::new().fg(Color::Black).bg(Color::Cyan).bold()
+                } else if self.form.remote.is_empty() {
+                    Style::new().fg(Color::DarkGray)
+                } else {
+                    Style::new().fg(Color::White).bold()
+                };
+                let remote_widget = Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        remote_prefix,
+                        if remote_focused {
+                            Style::new().fg(Color::Cyan).bold()
+                        } else {
+                            Style::new().fg(Color::Gray)
+                        },
+                    ),
+                    Span::styled(format!(" {remote_val} "), remote_val_style),
+                    Span::styled(
+                        "   (格式 host:port 或 纯端口)",
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                ]));
+                f.render_widget(remote_widget, remote_line);
+
+                // --- 2. 远端服务发现列表区 ---
+                let is_ports_focused = self.form.focus == FormFocus::RemoteList;
+                let ports_title = if self.pending_scan.is_some() {
+                    " ⚡ 远端可用服务 (🔍 正在探测中...) "
+                } else if self.remote_ports.is_empty() {
+                    " ⚡ 远端可用服务 (未检测到监听服务 · 按 r 刷新) "
+                } else {
+                    " ⚡ 远端可用服务 (回车一键转发 · 空格填入表单 · 按 r 刷新) "
+                };
+                let ports_border_style = if is_ports_focused {
+                    Style::new().fg(Color::Yellow).bold()
+                } else {
+                    Style::new().fg(Color::DarkGray)
+                };
+                let ports_block = Block::new()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(ports_title)
+                    .title_style(if is_ports_focused {
+                        Style::new().fg(Color::Yellow).bold()
+                    } else {
+                        Style::new().fg(Color::Gray)
+                    })
+                    .border_style(ports_border_style);
+
                 if self.remote_ports.is_empty() {
+                    let msg = if self.pending_scan.is_some() {
+                        "  ⏳ 正在通过 SSH 会话执行端口探测 (ss / netstat)..."
+                    } else {
+                        "  ○ 暂未检测到远端监听的 TCP 服务 (可在上方手动输入，或按 r 刷新探测)"
+                    };
                     f.render_widget(
-                        Paragraph::new("正在扫描远端监听端口…（无结果时按 r 刷新）")
-                            .block(Block::new().borders(Borders::ALL).title(" 远端端口 "))
-                            .style(Style::new().fg(Color::DarkGray)),
-                        list,
+                        Paragraph::new(msg)
+                            .style(Style::new().fg(Color::DarkGray))
+                            .block(ports_block),
+                        ports_section,
                     );
                 } else {
                     let rows: Vec<Row> = self
                         .remote_ports
                         .iter()
                         .enumerate()
-                        .map(|(_i, p)| {
+                        .map(|(i, p)| {
+                            let is_selected_row =
+                                is_ports_focused && i == self.ports_selected;
+                            let prefix = if is_selected_row { "▶ " } else { "  " };
+
                             let mapped = self
                                 .tunnels
                                 .iter()
-                                .any(|t| t.local_port == p.port || t.remote_port == p.port as u32);
-                            let status = if mapped { "已映射" } else { "" };
+                                .find(|t| t.remote_port == p.port as u32);
+                            let (status_text, status_style) = match mapped {
+                                Some(t) => (
+                                    format!("● 已映射 (本地 {})", t.local_port),
+                                    Style::new().fg(Color::Green),
+                                ),
+                                None => {
+                                    ("○ 未映射".to_string(), Style::new().fg(Color::DarkGray))
+                                }
+                            };
+
+                            let proc_name = if p.process.is_empty() {
+                                "未知进程".to_string()
+                            } else {
+                                p.process.clone()
+                            };
+
+                            let port_text = format!("{}{}", prefix, p.port);
+                            let port_style = if is_selected_row {
+                                Style::new().fg(Color::Yellow).bold()
+                            } else {
+                                Style::new().fg(Color::Cyan)
+                            };
+
                             Row::new(vec![
-                                Cell::from(p.port.to_string()),
-                                Cell::from(p.process.clone()),
-                                Cell::from(status),
+                                Cell::from(Span::styled(port_text, port_style)),
+                                Cell::from(Span::styled(
+                                    proc_name,
+                                    Style::new().fg(Color::White),
+                                )),
+                                Cell::from(Span::styled(status_text, status_style)),
                             ])
                         })
                         .collect();
+
                     let table = Table::new(
                         rows,
                         [
-                            Constraint::Length(10),
-                            Constraint::Length(30),
-                            Constraint::Length(10),
+                            Constraint::Length(12),
+                            Constraint::Length(28),
+                            Constraint::Min(16),
                         ],
                     )
-                    .header(Row::new(vec!["端口", "进程", "状态"]))
-                    .block(Block::new().borders(Borders::ALL).title(" 远端端口 "))
-                    .row_highlight_style(Style::new().fg(Color::Black).bg(Color::Cyan).bold());
-                    let mut state = ratatui::widgets::TableState::new()
-                        .with_selected(Some(self.ports_selected));
-                    f.render_stateful_widget(table, list, &mut state);
-                }
-                let help = format!(
-                    " [Enter]转发  [r]重新扫描  [↑/↓]选择  [q]返回    共 {} 个端口",
-                    self.remote_ports.len()
-                );
-                f.render_widget(
-                    Paragraph::new(help).style(Style::new().fg(Color::DarkGray)),
-                    footer,
-                );
-            }
-            Mode::Input => {
-                // 居中弹窗：添加隧道
-                let popup = centered_rect(64, 7, f.area());
-                f.render_widget(Clear, popup);
-                let block = Block::new().borders(Borders::ALL).title(" 添加隧道 ");
-                let [line1, line2, hint] =
-                    Layout::vertical([Length(1), Length(1), Length(1)]).areas(block.inner(popup));
-                f.render_widget(block, popup);
+                    .header(
+                        Row::new(vec!["  端口", "服务/进程名称", "当前状态"])
+                            .style(Style::new().fg(Color::Gray).bold()),
+                    )
+                    .block(ports_block)
+                    .row_highlight_style(if is_ports_focused {
+                        Style::new().fg(Color::Black).bg(Color::Yellow).bold()
+                    } else {
+                        Style::new().fg(Color::White).bg(Color::DarkGray)
+                    });
 
-                let local_style = if self.form.field == 0 {
-                    Style::new().fg(Color::Cyan).bold()
-                } else {
-                    Style::new().fg(Color::DarkGray)
+                    let mut state =
+                        TableState::new().with_selected(Some(self.ports_selected));
+                    f.render_stateful_widget(table, ports_section, &mut state);
+                }
+
+                // --- 3. 底部提示区 ---
+                let hint_line = match self.form.focus {
+                    FormFocus::LocalPort | FormFocus::RemoteTarget => Line::from(vec![
+                        Span::styled(" [Tab/Shift-Tab] ", Style::new().fg(Color::Yellow)),
+                        Span::raw("切换输入/列表   "),
+                        Span::styled(" [Enter] ", Style::new().fg(Color::Green)),
+                        Span::raw("确认创建   "),
+                        Span::styled(" [↓] ", Style::new().fg(Color::Cyan)),
+                        Span::raw("快速选端口   "),
+                        Span::styled(" [Esc] ", Style::new().fg(Color::Red)),
+                        Span::raw("取消"),
+                    ]),
+                    FormFocus::RemoteList => Line::from(vec![
+                        Span::styled(" [Enter] ", Style::new().fg(Color::Green).bold()),
+                        Span::styled("⚡一键创建   ", Style::new().fg(Color::Green).bold()),
+                        Span::styled(" [Space] ", Style::new().fg(Color::Cyan)),
+                        Span::raw("填入表单修改   "),
+                        Span::styled(" [↑/↓/j/k] ", Style::new().fg(Color::Yellow)),
+                        Span::raw("选择   "),
+                        Span::styled(" [r] ", Style::new().fg(Color::Magenta)),
+                        Span::raw("刷新   "),
+                        Span::styled(" [Tab/Esc] ", Style::new().fg(Color::Gray)),
+                        Span::raw("返回输入/取消"),
+                    ]),
                 };
-                let remote_style = if self.form.field == 1 {
-                    Style::new().fg(Color::Cyan).bold()
-                } else {
-                    Style::new().fg(Color::DarkGray)
-                };
+
                 f.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(" 本地端口: ", Style::new().fg(Color::Gray)),
-                        Span::styled(format!("[{}]", self.form.local_port), local_style),
-                    ])),
-                    line1,
-                );
-                f.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(" 远端目标: ", Style::new().fg(Color::Gray)),
-                        Span::styled(format!("[{}]", self.form.remote), remote_style),
-                        Span::styled("  留空=localhost:本地端口", Style::new().fg(Color::DarkGray)),
-                    ])),
-                    line2,
-                );
-                f.render_widget(
-                    Paragraph::new(" [Tab]切换字段  [Enter]提交  [Esc]取消")
+                    Paragraph::new(hint_line)
+                        .alignment(Alignment::Center)
                         .style(Style::new().fg(Color::DarkGray)),
-                    hint,
-                );
-                // 帮助栏保持可见
-                let help = format!(
-                    " [a]新增  [d]删除  [l]日志  [p]端口  [↑/↓]选择  [q]退出    共 {} 条隧道",
-                    self.tunnels.len()
-                );
-                f.render_widget(
-                    Paragraph::new(help).style(Style::new().fg(Color::DarkGray)),
-                    footer,
+                    hint_section,
                 );
             }
         }
@@ -644,7 +943,9 @@ pub(crate) async fn run(
     event_rx: mpsc::UnboundedReceiver<TunnelEvent>,
 ) -> io::Result<()> {
     use crossterm::execute;
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
     use ratatui::backend::CrosstermBackend;
     use ratatui::Terminal;
 
@@ -652,7 +953,8 @@ pub(crate) async fn run(
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ =
+            execute!(std::io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
         original_hook(info);
     }));
 
