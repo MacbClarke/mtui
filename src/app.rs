@@ -337,48 +337,50 @@ impl App {
             header,
         );
 
-        // 隧道列表
-        let rows: Vec<Row> = self
-            .tunnels
-            .iter()
-            .map(|t| {
-                Row::new(vec![
-                    Cell::from(t.local_port.to_string()),
-                    Cell::from(format!("{}:{}", t.remote_host, t.remote_port)),
-                    Cell::from(t.connections.to_string()),
-                    Cell::from(Self::fmt_rate(t.rx_rate)),
-                    Cell::from(Self::fmt_rate(t.tx_rate)),
-                    Cell::from(Self::fmt_bytes(t.rx_bytes)),
-                    Cell::from(Self::fmt_bytes(t.tx_bytes)),
-                ])
-            })
-            .collect();
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(10),
-                Constraint::Length(22),
-                Constraint::Length(6),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(10),
-            ],
-        )
-        .header(Row::new(vec![
-            "本地端口", "远端目标", "连接", "↓速率", "↑速率", "↓累计", "↑累计",
-        ]))
-        .block(Block::new().borders(Borders::ALL).title(" 隧道 "))
-        .row_highlight_style(Style::new().fg(Color::Black).bg(Color::Cyan).bold());
-        let mut state = ratatui::widgets::TableState::new()
-            .with_selected(Some(self.selected));
-        f.render_stateful_widget(table, list, &mut state);
+        // 隧道列表（Log 模式下不渲染，避免与日志面板重叠）
+        if !matches!(self.mode, Mode::Log { .. }) {
+            let rows: Vec<Row> = self
+                .tunnels
+                .iter()
+                .map(|t| {
+                    Row::new(vec![
+                        Cell::from(t.local_port.to_string()),
+                        Cell::from(format!("{}:{}", t.remote_host, t.remote_port)),
+                        Cell::from(t.connections.to_string()),
+                        Cell::from(Self::fmt_rate(t.rx_rate)),
+                        Cell::from(Self::fmt_rate(t.tx_rate)),
+                        Cell::from(Self::fmt_bytes(t.rx_bytes)),
+                        Cell::from(Self::fmt_bytes(t.tx_bytes)),
+                    ])
+                })
+                .collect();
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Length(10),
+                    Constraint::Length(22),
+                    Constraint::Length(6),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                ],
+            )
+            .header(Row::new(vec![
+                "本地端口", "远端目标", "连接", "↓速率", "↑速率", "↓累计", "↑累计",
+            ]))
+            .block(Block::new().borders(Borders::ALL).title(" 隧道 "))
+            .row_highlight_style(Style::new().fg(Color::Black).bg(Color::Cyan).bold());
+            let mut state = ratatui::widgets::TableState::new()
+                .with_selected(Some(self.selected));
+            f.render_stateful_widget(table, list, &mut state);
+        }
 
-        // 底栏：帮助 / 输入表单
+        // 底栏：帮助 / 输入表单 / 日志操作提示
         match self.mode {
             Mode::List => {
                 let help = format!(
-                    " [a]新增  [d]删除  [↑/↓]选择  [q]退出    共 {} 条隧道",
+                    " [a]新增  [d]删除  [l]日志  [↑/↓]选择  [q]退出    共 {} 条隧道",
                     self.tunnels.len()
                 );
                 f.render_widget(
