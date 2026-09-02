@@ -7,7 +7,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Constraint::{Length, Min};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, List, Paragraph, Row, Table};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::tunnel::{Command, ConnectionStatus, Event as TunnelEvent, TunnelInfo};
@@ -18,6 +18,8 @@ enum Mode {
     List,
     /// 新增隧道表单
     Input,
+    /// 查看选中隧道的日志
+    Log { port: u16, scroll: usize },
 }
 
 /// 新增表单：两个字段（本地端口 / 远端 host:port）
@@ -123,6 +125,11 @@ impl App {
                         self.conn_status = status;
                         self.tunnels = tunnels;
                         self.selected = self.selected.min(self.tunnels.len().saturating_sub(1));
+                        if let Mode::Log { port, .. } = self.mode {
+                            if !self.tunnels.iter().any(|t| t.local_port == port) {
+                                self.mode = Mode::List;
+                            }
+                        }
                     }
                 }
             }
@@ -167,8 +174,41 @@ impl App {
                 KeyCode::Char('d') | KeyCode::Delete => self.remove_selected(),
                 KeyCode::Char('j') | KeyCode::Down => self.select(1),
                 KeyCode::Char('k') | KeyCode::Up => self.select(-1),
+                KeyCode::Char('l') => {
+                    if let Some(t) = self.tunnels.get(self.selected) {
+                        self.mode = Mode::Log { port: t.local_port, scroll: 0 };
+                        self.status = None;
+                    }
+                }
                 _ => {}
-            },
+            }
+            Mode::Log { port, scroll } => {
+                let mut new_scroll = scroll;
+                let mut back = false;
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if let Some(t) = self.tunnels.iter().find(|t| t.local_port == port) {
+                            new_scroll = (new_scroll + 1).min(t.log.len().saturating_sub(1));
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        new_scroll = new_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Char('g') => new_scroll = 0,
+                    KeyCode::Char('G') => {
+                        if let Some(t) = self.tunnels.iter().find(|t| t.local_port == port) {
+                            new_scroll = t.log.len().saturating_sub(1);
+                        }
+                    }
+                    KeyCode::Char('q') | KeyCode::Esc => back = true,
+                    _ => {}
+                }
+                if back {
+                    self.mode = Mode::List;
+                } else {
+                    self.mode = Mode::Log { port, scroll: new_scroll };
+                }
+            }
             Mode::Input => match key.code {
                 KeyCode::Char(c) => self.form.current().push(c),
                 KeyCode::Backspace => {
@@ -340,6 +380,33 @@ impl App {
                 let help = format!(
                     " [a]新增  [d]删除  [↑/↓]选择  [q]退出    共 {} 条隧道",
                     self.tunnels.len()
+                );
+                f.render_widget(
+                    Paragraph::new(help).style(Style::new().fg(Color::DarkGray)),
+                    footer,
+                );
+            }
+            Mode::Log { port, scroll } => {
+                let tunnel: Option<&TunnelInfo> = self.tunnels.iter().find(|t| t.local_port == port);
+                let log: Vec<String> = tunnel
+                    .map(|t| t.log.clone())
+                    .unwrap_or_default();
+                let lines: Vec<ratatui::widgets::ListItem> = log
+                    .iter()
+                    .skip(scroll)
+                    .map(|l| ratatui::widgets::ListItem::new(l.clone()))
+                    .collect();
+                f.render_widget(
+                    List::new(lines).block(
+                        Block::new()
+                            .borders(Borders::ALL)
+                            .title(format!(" 隧道 {port} 日志 ")),
+                    ),
+                    list,
+                );
+                let help = format!(
+                    " [↑/↓]滚动  [g/G]首/尾  [q]返回    共 {} 条",
+                    log.len()
                 );
                 f.render_widget(
                     Paragraph::new(help).style(Style::new().fg(Color::DarkGray)),

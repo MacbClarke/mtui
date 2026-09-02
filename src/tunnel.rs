@@ -1,7 +1,7 @@
 //! 隧道控制中心：维护一条 SSH 主连接，管理多个本地端口监听的动态启停。
 //! Step 4：新增实时速率统计、断线检测与自动重连。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,6 +67,19 @@ pub(crate) enum ConnectionStatus {
     Disconnected,
 }
 
+/// 单条隧道的日志（有序环形缓冲，最多保留 [`LOG_CAPACITY`] 条）
+pub(crate) type TunnelLog = Arc<std::sync::Mutex<VecDeque<String>>>;
+const LOG_CAPACITY: usize = 200;
+
+fn log_push(log: &TunnelLog, msg: String) {
+    if let Ok(mut l) = log.lock() {
+        if l.len() >= LOG_CAPACITY {
+            l.pop_front();
+        }
+        l.push_back(msg);
+    }
+}
+
 /// 单条隧道（本地端口监听）的运行时状态
 struct TunnelEntry {
     remote_host: String,
@@ -78,6 +91,8 @@ struct TunnelEntry {
     tx_bytes: Arc<AtomicU64>,
     /// 监听循环任务；abort 即释放本地端口
     task: JoinHandle<()>,
+    /// 该隧道的事件日志
+    log: TunnelLog,
 }
 
 /// 向外部（CLI/TUI）暴露的隧道快照
@@ -91,6 +106,8 @@ pub(crate) struct TunnelInfo {
     pub tx_bytes: u64,
     pub rx_rate: u64,
     pub tx_rate: u64,
+    /// 该隧道的事件日志（旧→新）
+    pub log: Vec<String>,
 }
 
 /// 隧道控制中心：持有 SSH 主连接句柄 + 隧道表
@@ -173,13 +190,13 @@ async fn listen_loop(
     connections: Arc<AtomicUsize>,
     rx_bytes: Arc<AtomicU64>,
     tx_bytes: Arc<AtomicU64>,
+    log: TunnelLog,
 ) {
-    println!("[+] 隧道 {local_port} -> {remote_host}:{remote_port}");
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[错误] 隧道 {local_port} accept 失败：{e}");
+                log_push(&log, format!("accept 失败：{e}"));
                 continue;
             }
         };
@@ -187,16 +204,19 @@ async fn listen_loop(
         let connections = Arc::clone(&connections);
         let rx_bytes = Arc::clone(&rx_bytes);
         let tx_bytes = Arc::clone(&tx_bytes);
+        let log = Arc::clone(&log);
         let (host, port) = (remote_host.clone(), remote_port);
         let peer_addr = peer.ip().to_string();
         let peer_port = peer.port().into();
         tokio::spawn(async move {
             connections.fetch_add(1, Ordering::SeqCst);
+            log_push(&log, format!("{peer} 接入"));
             // 锁只覆盖 channel open 阶段（relay 内部），中继过程不占用 session
             let result = relay(handle, stream, &host, port, &peer_addr, peer_port, rx_bytes, tx_bytes).await;
             connections.fetch_sub(1, Ordering::SeqCst);
-            if let Err(e) = result {
-                eprintln!("[-] 隧道 {local_port} {peer} 转发失败：{e}");
+            match result {
+                Ok(()) => log_push(&log, format!("{peer} 连接结束")),
+                Err(e) => log_push(&log, format!("{peer} 转发失败：{e}")),
             }
         });
     }
@@ -267,18 +287,15 @@ impl TunnelManager {
         if !closed {
             return self.status;
         }
-        eprintln!("[!] SSH 主连接断开，尝试重连…");
         for attempt in 1..=5 {
             self.status = ConnectionStatus::Reconnecting(attempt);
             match Self::connect_handle(&self.params).await {
                 Ok(new_handle) => {
                     *self.handle.lock().await = new_handle;
                     self.status = ConnectionStatus::Connected;
-                    eprintln!("[OK] 已重连，隧道恢复");
                     return self.status;
                 }
-                Err(e) => {
-                    eprintln!("[!] 重连第 {attempt} 次失败：{e}");
+                Err(_) => {
                     let wait = Duration::from_secs(1u64 << attempt.min(4));
                     tokio::time::sleep(wait).await;
                 }
@@ -301,6 +318,8 @@ impl TunnelManager {
         let connections = Arc::new(AtomicUsize::new(0));
         let rx_bytes = Arc::new(AtomicU64::new(0));
         let tx_bytes = Arc::new(AtomicU64::new(0));
+        let log: TunnelLog = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        log_push(&log, format!("隧道已创建：{local_port} -> {remote_host}:{remote_port}"));
         let task = tokio::spawn(listen_loop(
             listener,
             Arc::clone(&self.handle),
@@ -310,6 +329,7 @@ impl TunnelManager {
             Arc::clone(&connections),
             Arc::clone(&rx_bytes),
             Arc::clone(&tx_bytes),
+            Arc::clone(&log),
         ));
         self.tunnels.insert(
             local_port,
@@ -320,6 +340,7 @@ impl TunnelManager {
                 rx_bytes,
                 tx_bytes,
                 task,
+                log,
             },
         );
         Ok(())
@@ -361,6 +382,7 @@ impl TunnelManager {
                     tx_bytes: tx,
                     rx_rate,
                     tx_rate,
+                    log: e.log.lock().map(|l| l.iter().cloned().collect()).unwrap_or_default(),
                 }
             })
             .collect();
