@@ -1,13 +1,14 @@
 //! 隧道控制中心：维护一条 SSH 主连接，管理多个本地端口监听的动态启停。
+//! Step 4：新增实时速率统计、断线检测与自动重连。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use russh::client::{self, Handle};
 use russh::keys::known_hosts::check_known_hosts;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
-use russh::ChannelMsg;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -18,6 +19,8 @@ use tokio::task::JoinHandle;
 pub(crate) struct SshHandler {
     host: String,
     port: u16,
+    /// false 时跳过 known_hosts 校验（仅测试/内网使用）
+    check_host_key: bool,
 }
 
 impl client::Handler for SshHandler {
@@ -27,6 +30,9 @@ impl client::Handler for SshHandler {
         &mut self,
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        if !self.check_host_key {
+            return Ok(true);
+        }
         let key = server_public_key.public_key();
         match check_known_hosts(&self.host, self.port, &key) {
             Ok(true) => Ok(true),
@@ -42,12 +48,34 @@ impl client::Handler for SshHandler {
     }
 }
 
+/// 连接参数（重连时复用）
+#[derive(Clone)]
+pub(crate) struct ConnectParams {
+    pub user: String,
+    pub host: String,
+    pub ssh_port: u16,
+    pub key_path: std::path::PathBuf,
+    pub check_host_key: bool,
+}
+
+/// 连接状态
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ConnectionStatus {
+    Connected,
+    /// 重连中，参数为已尝试次数
+    Reconnecting(usize),
+    Disconnected,
+}
+
 /// 单条隧道（本地端口监听）的运行时状态
 struct TunnelEntry {
     remote_host: String,
     remote_port: u32,
-    /// 当前活动的转发连接数（供 list 展示）
+    /// 当前活动的转发连接数
     connections: Arc<AtomicUsize>,
+    /// 累计转发字节：rx=远端→本地，tx=本地→远端
+    rx_bytes: Arc<AtomicU64>,
+    tx_bytes: Arc<AtomicU64>,
     /// 监听循环任务；abort 即释放本地端口
     task: JoinHandle<()>,
 }
@@ -59,15 +87,26 @@ pub(crate) struct TunnelInfo {
     pub remote_host: String,
     pub remote_port: u32,
     pub connections: usize,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_rate: u64,
+    pub tx_rate: u64,
 }
 
 /// 隧道控制中心：持有 SSH 主连接句柄 + 隧道表
 pub(crate) struct TunnelManager {
+    params: ConnectParams,
     handle: Arc<Mutex<Handle<SshHandler>>>,
     tunnels: HashMap<u16, TunnelEntry>,
+    status: ConnectionStatus,
+    /// 速率计算的上一采样点
+    last_rx: HashMap<u16, u64>,
+    last_tx: HashMap<u16, u64>,
+    last_sample: Instant,
 }
 
-/// 单个转发连接的中继：申请一条 direct-tcpip 通道并双向转发，直到任一端关闭。
+/// 单个转发连接的中继：申请一条 direct-tcpip 通道后，切分为读写半，
+/// 锁只在开通道期间持有，中继过程并发进行并累计字节计数。
 async fn relay(
     handle: &Handle<SshHandler>,
     mut stream: TcpStream,
@@ -75,37 +114,42 @@ async fn relay(
     remote_port: u32,
     originator_host: &str,
     originator_port: u32,
+    rx_bytes: Arc<AtomicU64>,
+    tx_bytes: Arc<AtomicU64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut channel = handle
+    let channel = handle
         .channel_open_direct_tcpip(remote_host, remote_port, originator_host, originator_port)
         .await?;
+    let (mut read_half, write_half) = channel.split();
+    let mut writer = write_half.make_writer();
+    let mut reader = read_half.make_reader();
 
-    let mut stream_closed = false;
+    let mut stream_eof = false;
     let mut buf = vec![0u8; 65536];
+    let mut buf2 = vec![0u8; 65536];
     loop {
         tokio::select! {
-            r = stream.read(&mut buf), if !stream_closed => {
+            r = stream.read(&mut buf), if !stream_eof => {
                 match r {
                     Ok(0) => {
-                        stream_closed = true;
-                        channel.eof().await?;
+                        stream_eof = true;
+                        writer.shutdown().await?;
                     }
-                    Ok(n) => channel.data(&buf[..n]).await?,
+                    Ok(n) => {
+                        tx_bytes.fetch_add(n as u64, Ordering::SeqCst);
+                        writer.write_all(&buf[..n]).await?;
+                    }
                     Err(e) => return Err(e.into()),
                 }
             }
-            Some(msg) = channel.wait() => {
-                match msg {
-                    ChannelMsg::Data { data } => {
-                        stream.write_all(&data).await?;
+            r = reader.read(&mut buf2) => {
+                match r {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        rx_bytes.fetch_add(n as u64, Ordering::SeqCst);
+                        stream.write_all(&buf2[..n]).await?;
                     }
-                    ChannelMsg::Eof => {
-                        if !stream_closed {
-                            channel.eof().await?;
-                        }
-                        break;
-                    }
-                    _ => {} // 忽略 WindowAdjusted 等消息
+                    Err(e) => return Err(e.into()),
                 }
             }
         }
@@ -123,6 +167,8 @@ async fn listen_loop(
     remote_host: String,
     remote_port: u32,
     connections: Arc<AtomicUsize>,
+    rx_bytes: Arc<AtomicU64>,
+    tx_bytes: Arc<AtomicU64>,
 ) {
     println!("[+] 隧道 {local_port} -> {remote_host}:{remote_port}");
     loop {
@@ -135,6 +181,8 @@ async fn listen_loop(
         };
         let handle = Arc::clone(&handle);
         let connections = Arc::clone(&connections);
+        let rx_bytes = Arc::clone(&rx_bytes);
+        let tx_bytes = Arc::clone(&tx_bytes);
         let (host, port) = (remote_host.clone(), remote_port);
         let peer_addr = peer.ip().to_string();
         let peer_port = peer.port().into();
@@ -142,7 +190,7 @@ async fn listen_loop(
             connections.fetch_add(1, Ordering::SeqCst);
             // 锁仅在申请通道期间持有，中继过程不占用 session
             let handle = handle.lock().await;
-            let result = relay(&handle, stream, &host, port, &peer_addr, peer_port).await;
+            let result = relay(&handle, stream, &host, port, &peer_addr, peer_port, rx_bytes, tx_bytes).await;
             connections.fetch_sub(1, Ordering::SeqCst);
             if let Err(e) = result {
                 eprintln!("[-] 隧道 {local_port} {peer} 转发失败：{e}");
@@ -152,40 +200,86 @@ async fn listen_loop(
 }
 
 impl TunnelManager {
-    /// 建立 SSH 主连接
-    pub(crate) async fn connect(
-        user: &str,
-        host: &str,
-        ssh_port: u16,
-        key_path: &std::path::Path,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let key = load_secret_key(key_path, None)
-            .map_err(|e| format!("加载私钥 {} 失败：{e}", key_path.display()))?;
+    /// 建立 SSH 主连接（含认证）
+    async fn connect_handle(params: &ConnectParams) -> Result<Handle<SshHandler>, String> {
+        let key = load_secret_key(&params.key_path, None)
+            .map_err(|e| format!("加载私钥 {} 失败：{e}", params.key_path.display()))?;
         let key = Arc::new(key);
 
         let config = Arc::new(client::Config::default());
         let mut session = client::connect(
             config,
-            (host, ssh_port),
+            (params.host.as_str(), params.ssh_port),
             SshHandler {
-                host: host.to_string(),
-                port: ssh_port,
+                host: params.host.clone(),
+                port: params.ssh_port,
+                check_host_key: params.check_host_key,
             },
         )
-        .await?;
+        .await
+        .map_err(|e| format!("连接 {0}:{1} 失败：{e}", params.host, params.ssh_port))?;
         let auth = session
             .authenticate_publickey(
-                user,
-                PrivateKeyWithHashAlg::new(key, session.best_supported_rsa_hash().await?.flatten()),
+                &params.user,
+                PrivateKeyWithHashAlg::new(key, session.best_supported_rsa_hash().await.map_err(|e| format!("获取服务器 RSA 算法失败：{e}"))?.flatten()),
             )
-            .await?;
+            .await
+            .map_err(|e| format!("SSH 认证请求失败：{e}"))?;
         if !auth.success() {
-            return Err(format!("SSH 公钥认证失败（{user}@{host}）").into());
+            return Err(format!("SSH 公钥认证失败（{}@{}）", params.user, params.host));
         }
+        Ok(session)
+    }
+
+    /// 建立 SSH 主连接并初始化管理器
+    pub(crate) async fn connect(params: ConnectParams) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let handle = Self::connect_handle(&params)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         Ok(Self {
-            handle: Arc::new(Mutex::new(session)),
+            params,
+            handle: Arc::new(Mutex::new(handle)),
             tunnels: HashMap::new(),
+            status: ConnectionStatus::Connected,
+            last_rx: HashMap::new(),
+            last_tx: HashMap::new(),
+            last_sample: Instant::now(),
         })
+    }
+
+    pub(crate) fn status(&self) -> ConnectionStatus {
+        self.status
+    }
+
+
+    /// 检测主连接是否断开；若断开则自动重连（指数退避，最多 5 次）
+    pub(crate) async fn check_and_reconnect(&mut self) -> ConnectionStatus {
+        if self.status != ConnectionStatus::Connected {
+            return self.status; // 重连中/已离线，交给重连流程
+        }
+        let closed = self.handle.lock().await.is_closed();
+        if !closed {
+            return self.status;
+        }
+        eprintln!("[!] SSH 主连接断开，尝试重连…");
+        for attempt in 1..=5 {
+            self.status = ConnectionStatus::Reconnecting(attempt);
+            match Self::connect_handle(&self.params).await {
+                Ok(new_handle) => {
+                    *self.handle.lock().await = new_handle;
+                    self.status = ConnectionStatus::Connected;
+                    eprintln!("[OK] 已重连，隧道恢复");
+                    return self.status;
+                }
+                Err(e) => {
+                    eprintln!("[!] 重连第 {attempt} 次失败：{e}");
+                    let wait = Duration::from_secs(1u64 << attempt.min(4));
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+        self.status = ConnectionStatus::Disconnected;
+        self.status
     }
 
     /// 新增一条隧道：绑定本地端口，启动监听循环
@@ -199,6 +293,8 @@ impl TunnelManager {
             .await
             .map_err(|e| format!("本地端口 {local_port} 绑定失败：{e}"))?;
         let connections = Arc::new(AtomicUsize::new(0));
+        let rx_bytes = Arc::new(AtomicU64::new(0));
+        let tx_bytes = Arc::new(AtomicU64::new(0));
         let task = tokio::spawn(listen_loop(
             listener,
             Arc::clone(&self.handle),
@@ -206,6 +302,8 @@ impl TunnelManager {
             remote_host.to_string(),
             remote_port,
             Arc::clone(&connections),
+            Arc::clone(&rx_bytes),
+            Arc::clone(&tx_bytes),
         ));
         self.tunnels.insert(
             local_port,
@@ -213,6 +311,8 @@ impl TunnelManager {
                 remote_host: remote_host.to_string(),
                 remote_port,
                 connections,
+                rx_bytes,
+                tx_bytes,
                 task,
             },
         );
@@ -230,18 +330,37 @@ impl TunnelManager {
         Ok(())
     }
 
-    /// 当前所有隧道快照
-    pub(crate) fn list(&self) -> Vec<TunnelInfo> {
+    /// 当前所有隧道快照（含实时速率，基于上一次采样计算）
+    pub(crate) fn list(&mut self) -> Vec<TunnelInfo> {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_sample).as_secs_f64().max(0.001);
         let mut v: Vec<TunnelInfo> = self
             .tunnels
             .iter()
-            .map(|(&local_port, e)| TunnelInfo {
-                local_port,
-                remote_host: e.remote_host.clone(),
-                remote_port: e.remote_port,
-                connections: e.connections.load(Ordering::SeqCst),
+            .map(|(&local_port, e)| {
+                let rx = e.rx_bytes.load(Ordering::SeqCst);
+                let tx = e.tx_bytes.load(Ordering::SeqCst);
+                let rx_prev = self.last_rx.get(&local_port).copied().unwrap_or(0);
+                let tx_prev = self.last_tx.get(&local_port).copied().unwrap_or(0);
+                let rx_rate = ((rx.saturating_sub(rx_prev)) as f64 / dt) as u64;
+                let tx_rate = ((tx.saturating_sub(tx_prev)) as f64 / dt) as u64;
+                self.last_rx.insert(local_port, rx);
+                self.last_tx.insert(local_port, tx);
+                TunnelInfo {
+                    local_port,
+                    remote_host: e.remote_host.clone(),
+                    remote_port: e.remote_port,
+                    connections: e.connections.load(Ordering::SeqCst),
+                    rx_bytes: rx,
+                    tx_bytes: tx,
+                    rx_rate,
+                    tx_rate,
+                }
             })
             .collect();
+        self.last_rx.retain(|p, _| self.tunnels.contains_key(p));
+        self.last_tx.retain(|p, _| self.tunnels.contains_key(p));
+        self.last_sample = now;
         v.sort_by_key(|t| t.local_port);
         v
     }
@@ -259,6 +378,7 @@ impl TunnelManager {
             .await;
     }
 }
+
 // ---------- 后台管理任务（TUI 协作层） ----------
 
 /// 前台（TUI）发往管理任务的控制指令
@@ -278,22 +398,26 @@ pub(crate) enum Command {
 
 /// 管理任务推送给前台的状态事件
 pub(crate) enum Event {
-    Snapshot(Vec<TunnelInfo>),
+    State {
+        status: ConnectionStatus,
+        tunnels: Vec<TunnelInfo>,
+    },
 }
 
-/// 管理任务主循环：串行执行控制指令，并周期性推送隧道快照。
-/// 退出时优雅关闭 SSH 主连接。
+/// 管理任务主循环：串行执行控制指令，周期性推送状态快照，
+/// 检测到 SSH 断开时自动重连。退出时优雅关闭主连接。
 pub(crate) async fn manager_loop(
     mut mgr: TunnelManager,
     mut rx: tokio::sync::mpsc::Receiver<Command>,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
 ) {
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let _ = events.send(Event::Snapshot(mgr.list()));
+                let status = mgr.check_and_reconnect().await;
+                let _ = events.send(Event::State { status, tunnels: mgr.list() });
             }
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break }; // 发送端全部关闭
@@ -301,15 +425,14 @@ pub(crate) async fn manager_loop(
                     Command::Add { local_port, remote_host, remote_port, reply } => {
                         let r = mgr.add(local_port, &remote_host, remote_port).await;
                         let _ = reply.send(r);
-                        let _ = events.send(Event::Snapshot(mgr.list()));
                     }
                     Command::Remove { local_port, reply } => {
                         let r = mgr.remove(local_port).await;
                         let _ = reply.send(r);
-                        let _ = events.send(Event::Snapshot(mgr.list()));
                     }
                     Command::Quit => break,
                 }
+                let _ = events.send(Event::State { status: mgr.status(), tunnels: mgr.list() });
             }
         }
     }

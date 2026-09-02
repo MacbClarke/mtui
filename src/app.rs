@@ -10,7 +10,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::tunnel::{Command, Event as TunnelEvent, TunnelInfo};
+use crate::tunnel::{Command, ConnectionStatus, Event as TunnelEvent, TunnelInfo};
 
 /// 界面模式
 enum Mode {
@@ -71,6 +71,8 @@ pub(crate) struct App {
     selected: usize,
     mode: Mode,
     form: Form,
+    /// SSH 连接状态
+    conn_status: ConnectionStatus,
     /// 待发送到后台的命令（on_key 同步收集，主循环异步发送）
     pending_cmds: Vec<Command>,
     /// 挂起的命令回执（oneshot 无法跨 await 等待，在主循环轮询）
@@ -95,6 +97,7 @@ impl App {
             pending_cmds: Vec::new(),
             pending_reply: None,
             status: None,
+            conn_status: ConnectionStatus::Connected,
             quit: false,
         }
     }
@@ -116,8 +119,9 @@ impl App {
             // 2. 后台快照
             while let Ok(ev) = self.event_rx.try_recv() {
                 match ev {
-                    TunnelEvent::Snapshot(list) => {
-                        self.tunnels = list;
+                    TunnelEvent::State { status, tunnels } => {
+                        self.conn_status = status;
+                        self.tunnels = tunnels;
                         self.selected = self.selected.min(self.tunnels.len().saturating_sub(1));
                     }
                 }
@@ -230,13 +234,52 @@ impl App {
 
     // ---------- 渲染 ----------
 
+    /// 将字节/秒格式化为可读单位
+    fn fmt_rate(bytes: u64) -> String {
+        let b = bytes as f64;
+        if b >= 1024.0 * 1024.0 {
+            format!("{:.1} MB/s", b / 1024.0 / 1024.0)
+        } else if b >= 1024.0 {
+            format!("{:.1} KB/s", b / 1024.0)
+        } else {
+            format!("{b} B/s")
+        }
+    }
+
+    /// 将累计字节格式化为可读单位（无速率后缀）
+    fn fmt_bytes(bytes: u64) -> String {
+        let b = bytes as f64;
+        if b >= 1024.0 * 1024.0 {
+            format!("{:.1} MB", b / 1024.0 / 1024.0)
+        } else if b >= 1024.0 {
+            format!("{:.1} KB", b / 1024.0)
+        } else {
+            format!("{b} B")
+        }
+    }
+
+    /// 连接状态横幅
+    fn status_banner(&self) -> (String, Style) {
+        match self.conn_status {
+            ConnectionStatus::Connected => ("● 已连接".into(), Style::new().fg(Color::Green)),
+            ConnectionStatus::Reconnecting(n) => (
+                format!("◐ 重连中(第{n}次)…"),
+                Style::new().fg(Color::Yellow).bold(),
+            ),
+            ConnectionStatus::Disconnected => ("○ 已断开".into(), Style::new().fg(Color::Red).bold()),
+        }
+    }
+
     fn draw(&mut self, f: &mut Frame) {
         let [header, list, footer] =
             Layout::vertical([Length(3), Min(0), Length(3)]).areas(f.area());
 
-        // 标题栏：进程名 + 状态消息
+        // 标题栏：进程名 + 连接状态 + 状态消息
         let mut title = " mtui — SSH 隧道 ".to_string();
         let mut border_style = Style::default();
+        let (banner, banner_style) = self.status_banner();
+        border_style = border_style.patch(banner_style);
+        title.push_str(&banner);
         if let Some((msg, is_err)) = &self.status {
             title.push_str("  ·  ");
             title.push_str(msg);
@@ -263,20 +306,28 @@ impl App {
                     Cell::from(t.local_port.to_string()),
                     Cell::from(format!("{}:{}", t.remote_host, t.remote_port)),
                     Cell::from(t.connections.to_string()),
-                    Cell::from("运行"),
+                    Cell::from(Self::fmt_rate(t.rx_rate)),
+                    Cell::from(Self::fmt_rate(t.tx_rate)),
+                    Cell::from(Self::fmt_bytes(t.rx_bytes)),
+                    Cell::from(Self::fmt_bytes(t.tx_bytes)),
                 ])
             })
             .collect();
         let table = Table::new(
             rows,
             [
-                Constraint::Length(12),
-                Constraint::Length(28),
-                Constraint::Length(8),
-                Constraint::Length(8),
+                Constraint::Length(10),
+                Constraint::Length(22),
+                Constraint::Length(6),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
             ],
         )
-        .header(Row::new(vec!["本地端口", "远端目标", "连接数", "状态"]))
+        .header(Row::new(vec![
+            "本地端口", "远端目标", "连接", "↓速率", "↑速率", "↓累计", "↑累计",
+        ]))
         .block(Block::new().borders(Borders::ALL).title(" 隧道 "))
         .row_highlight_style(Style::new().fg(Color::Black).bg(Color::Cyan).bold());
         let mut state = ratatui::widgets::TableState::new()
