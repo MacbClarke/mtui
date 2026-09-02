@@ -105,10 +105,10 @@ pub(crate) struct TunnelManager {
     last_sample: Instant,
 }
 
-/// 单个转发连接的中继：申请一条 direct-tcpip 通道后，切分为读写半，
-/// 锁只在开通道期间持有，中继过程并发进行并累计字节计数。
+/// 单个转发连接的中继：锁内只做 channel open 并切分读写半，
+/// 随后释放锁，双向中继完全并发进行（互不阻塞），并累计字节计数。
 async fn relay(
-    handle: &Handle<SshHandler>,
+    session: Arc<Mutex<Handle<SshHandler>>>,
     mut stream: TcpStream,
     remote_host: &str,
     remote_port: u32,
@@ -117,10 +117,14 @@ async fn relay(
     rx_bytes: Arc<AtomicU64>,
     tx_bytes: Arc<AtomicU64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = handle
-        .channel_open_direct_tcpip(remote_host, remote_port, originator_host, originator_port)
-        .await?;
-    let (mut read_half, write_half) = channel.split();
+    let (mut read_half, write_half) = {
+        let handle = session.lock().await;
+        let channel = handle
+            .channel_open_direct_tcpip(remote_host, remote_port, originator_host, originator_port)
+            .await?;
+        channel.split()
+    };
+    // 锁已释放：make_writer/make_reader 基于克隆的 sender/receiver，不依赖会话锁
     let mut writer = write_half.make_writer();
     let mut reader = read_half.make_reader();
 
@@ -188,9 +192,8 @@ async fn listen_loop(
         let peer_port = peer.port().into();
         tokio::spawn(async move {
             connections.fetch_add(1, Ordering::SeqCst);
-            // 锁仅在申请通道期间持有，中继过程不占用 session
-            let handle = handle.lock().await;
-            let result = relay(&handle, stream, &host, port, &peer_addr, peer_port, rx_bytes, tx_bytes).await;
+            // 锁只覆盖 channel open 阶段（relay 内部），中继过程不占用 session
+            let result = relay(handle, stream, &host, port, &peer_addr, peer_port, rx_bytes, tx_bytes).await;
             connections.fetch_sub(1, Ordering::SeqCst);
             if let Err(e) = result {
                 eprintln!("[-] 隧道 {local_port} {peer} 转发失败：{e}");
