@@ -53,6 +53,7 @@ struct TunnelEntry {
 }
 
 /// 向外部（CLI/TUI）暴露的隧道快照
+#[derive(Clone)]
 pub(crate) struct TunnelInfo {
     pub local_port: u16,
     pub remote_host: String,
@@ -257,4 +258,60 @@ impl TunnelManager {
             .disconnect(russh::Disconnect::ByApplication, "", "English")
             .await;
     }
+}
+// ---------- 后台管理任务（TUI 协作层） ----------
+
+/// 前台（TUI）发往管理任务的控制指令
+pub(crate) enum Command {
+    Add {
+        local_port: u16,
+        remote_host: String,
+        remote_port: u32,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Remove {
+        local_port: u16,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Quit,
+}
+
+/// 管理任务推送给前台的状态事件
+pub(crate) enum Event {
+    Snapshot(Vec<TunnelInfo>),
+}
+
+/// 管理任务主循环：串行执行控制指令，并周期性推送隧道快照。
+/// 退出时优雅关闭 SSH 主连接。
+pub(crate) async fn manager_loop(
+    mut mgr: TunnelManager,
+    mut rx: tokio::sync::mpsc::Receiver<Command>,
+    events: tokio::sync::mpsc::UnboundedSender<Event>,
+) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let _ = events.send(Event::Snapshot(mgr.list()));
+            }
+            cmd = rx.recv() => {
+                let Some(cmd) = cmd else { break }; // 发送端全部关闭
+                match cmd {
+                    Command::Add { local_port, remote_host, remote_port, reply } => {
+                        let r = mgr.add(local_port, &remote_host, remote_port).await;
+                        let _ = reply.send(r);
+                        let _ = events.send(Event::Snapshot(mgr.list()));
+                    }
+                    Command::Remove { local_port, reply } => {
+                        let r = mgr.remove(local_port).await;
+                        let _ = reply.send(r);
+                        let _ = events.send(Event::Snapshot(mgr.list()));
+                    }
+                    Command::Quit => break,
+                }
+            }
+        }
+    }
+    mgr.shutdown().await;
 }

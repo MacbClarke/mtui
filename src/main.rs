@@ -1,17 +1,19 @@
 //! mtui — 动态 SSH 隧道工具
 //!
-//! Step 2：TunnelManager 动态生命周期管理。
-//! 交互命令：add <本地端口> <远端 host:port> / rm <端口> / ls / quit
+//! Step 3：Ratatui TUI 界面。架构：
+//!   TUI 前台（app.rs）──mpsc 指令/快照──► 管理任务（tunnel.rs）
+//!   管理任务持有 SSH 主连接 + 隧道表，TUI 只做渲染与键盘事件。
 
+mod app;
 mod tunnel;
 
-use std::io::{stdin, stdout, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use tunnel::TunnelManager;
+use tokio::sync::mpsc;
+use tunnel::{manager_loop, TunnelManager};
 
-/// mtui — 动态 SSH 隧道工具（Step 2：隧道动态增删）
+/// mtui — 动态 SSH 隧道工具
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
@@ -35,82 +37,6 @@ fn default_key_path() -> PathBuf {
         .join(".ssh/id_ed25519")
 }
 
-fn print_help() {
-    println!(
-        "命令：\n  \
-         add <本地端口> <远端host:port>   新增隧道\n  \
-         rm  <本地端口>                   停止隧道\n  \
-         ls                               列出隧道\n  \
-         quit                             退出"
-    );
-}
-
-/// 交互命令循环
-async fn repl(mgr: &mut TunnelManager) {
-    let mut line = String::new();
-    loop {
-        print!("mtui> ");
-        if stdout().flush().is_err() {
-            break;
-        }
-        match stdin().read_line(&mut line) {
-            Ok(0) => break, // stdin 关闭
-            Err(_) => break,
-            Ok(_) => {}
-        }
-        let cmd = line.trim();
-        let words: Vec<&str> = cmd.split_whitespace().collect();
-        match words.as_slice() {
-            [] => {}
-            ["quit"] | ["exit"] | ["q"] => break,
-            ["help"] | ["h"] => print_help(),
-            ["ls"] | ["list"] => {
-                let tunnels = mgr.list();
-                if tunnels.is_empty() {
-                    println!("（无隧道）");
-                }
-                for t in tunnels {
-                    println!(
-                        "  {:<5} -> {}:{}   ({} 个活动连接)",
-                        t.local_port, t.remote_host, t.remote_port, t.connections
-                    );
-                }
-            }
-            ["add", local, remote] => {
-                let local_port: u16 = match local.parse() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        println!("端口格式错误：{local}");
-                        continue;
-                    }
-                };
-                match remote.split_once(':') {
-                    Some((rh, rp)) => match rp.parse::<u32>() {
-                        Ok(rp) => match mgr.add(local_port, rh, rp).await {
-                            Ok(()) => {}
-                            Err(e) => println!("[错误] {e}"),
-                        },
-                        Err(_) => println!("端口格式错误：{rp}"),
-                    },
-                    None => println!("远端目标格式应为 host:port"),
-                }
-            }
-            ["rm", local] | ["remove", local] => {
-                match local.parse::<u16>() {
-                    Ok(port) => {
-                        if let Err(e) = mgr.remove(port).await {
-                            println!("[错误] {e}");
-                        }
-                    }
-                    Err(_) => println!("端口格式错误：{local}"),
-                }
-            }
-            _ => println!("未知命令：{cmd}（输入 help 查看帮助）"),
-        }
-        line.clear();
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
@@ -119,13 +45,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .split_once('@')
         .ok_or("目标格式应为 user@host，例如 root@example.com")?;
 
+    // 1. 建立 SSH 主连接（失败直接退出，不进 TUI）
     let key_path = args.key.clone().unwrap_or_else(default_key_path);
-    let mut mgr = TunnelManager::connect(user, host, args.ssh_port, &key_path).await?;
-    println!("[OK] 已连接 {user}@{host}:{}，输入 help 查看命令", args.ssh_port);
+    let mgr = TunnelManager::connect(user, host, args.ssh_port, &key_path).await?;
 
-    repl(&mut mgr).await;
+    // 2. 前后台解耦：管理任务持有 TunnelManager，TUI 通过通道交互
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    tokio::spawn(manager_loop(mgr, cmd_rx, event_tx));
 
-    mgr.shutdown().await;
-    println!("已断开连接");
+    // 3. TUI 主循环（退出时向管理任务发送 Quit）
+    app::run(cmd_tx, event_rx).await?;
     Ok(())
 }
