@@ -7,7 +7,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Constraint::{Length, Min};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, List, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, List, Paragraph, Row, Table};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::tunnel::{Command, ConnectionStatus, Event as TunnelEvent, TunnelInfo};
@@ -47,21 +47,43 @@ impl Form {
     }
 
     /// 提交解析：返回 (本地端口, 远端 host, 远端端口)
+    /// 规则：本地端口必填；远端留空 → localhost:本地端口；
+    /// 只填数字 → localhost:该端口；完整 host:port 原样使用。
     fn parse(&self) -> Result<(u16, String, u32), String> {
         let local_port: u16 = self
             .local_port
             .trim()
             .parse()
             .map_err(|_| format!("本地端口格式错误：{}", self.local_port.trim()))?;
-        let (host, port) = self
-            .remote
-            .trim()
-            .split_once(':')
-            .ok_or_else(|| format!("远端目标格式应为 host:port：{}", self.remote.trim()))?;
-        let remote_port: u32 = port
-            .parse()
-            .map_err(|_| format!("远端端口格式错误：{port}"))?;
-        Ok((local_port, host.to_string(), remote_port))
+        let remote = self.remote.trim();
+        let (host, remote_port) = if remote.is_empty() {
+            ("localhost".to_string(), local_port as u32)
+        } else if remote.chars().all(|c| c.is_ascii_digit()) {
+            let p: u32 = remote
+                .parse()
+                .map_err(|_| format!("远端端口格式错误：{remote}"))?;
+            ("localhost".to_string(), p)
+        } else {
+            match remote.split_once(':') {
+                Some((h, p)) => {
+                    let host = h.trim();
+                    if host.is_empty() {
+                        return Err("远端 host 不能为空".into());
+                    }
+                    let port: u32 = p
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("远端端口格式错误：{p}"))?;
+                    (host.to_string(), port)
+                }
+                None => {
+                    return Err(format!(
+                        "远端目标格式应为 host:port 或只填端口：{remote}"
+                    ))
+                }
+            }
+        };
+        Ok((local_port, host, remote_port))
     }
 }
 
@@ -216,7 +238,10 @@ impl App {
                 }
                 KeyCode::Tab => self.form.field = 1 - self.form.field,
                 KeyCode::Enter => {
-                    if self.form.field == 0 {
+                    if self.form.field == 0 && self.form.remote.trim().is_empty() {
+                        // 只填了本地端口：远端默认 localhost:本地端口，直接提交
+                        self.submit_form();
+                    } else if self.form.field == 0 {
                         self.form.field = 1;
                     } else {
                         self.submit_form();
@@ -311,6 +336,13 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        // 居中弹窗区域计算：输入弹窗用
+        fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+            let x = area.x + area.width.saturating_sub(width) / 2;
+            let y = area.y + area.height.saturating_sub(height) / 2;
+            Rect::new(x, y, width.min(area.width), height.min(area.height))
+        }
+
         let [header, list, footer] =
             Layout::vertical([Length(3), Min(0), Length(3)]).areas(f.area());
 
@@ -416,6 +448,14 @@ impl App {
                 );
             }
             Mode::Input => {
+                // 居中弹窗：添加隧道
+                let popup = centered_rect(64, 7, f.area());
+                f.render_widget(Clear, popup);
+                let block = Block::new().borders(Borders::ALL).title(" 添加隧道 ");
+                let [line1, line2, hint] =
+                    Layout::vertical([Length(1), Length(1), Length(1)]).areas(block.inner(popup));
+                f.render_widget(block, popup);
+
                 let local_style = if self.form.field == 0 {
                     Style::new().fg(Color::Cyan).bold()
                 } else {
@@ -426,15 +466,33 @@ impl App {
                 } else {
                     Style::new().fg(Color::DarkGray)
                 };
-                let line = Line::from(vec![
-                    Span::styled(" 本地端口: ", Style::new().fg(Color::Gray)),
-                    Span::styled(format!("[{}]", self.form.local_port), local_style),
-                    Span::styled("  远端目标: ", Style::new().fg(Color::Gray)),
-                    Span::styled(format!("[{}]", self.form.remote), remote_style),
-                    Span::styled("  [Tab]切换 [Enter]提交 [Esc]取消", Style::new().fg(Color::DarkGray)),
-                ]);
                 f.render_widget(
-                    Paragraph::new(line).block(Block::default()),
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(" 本地端口: ", Style::new().fg(Color::Gray)),
+                        Span::styled(format!("[{}]", self.form.local_port), local_style),
+                    ])),
+                    line1,
+                );
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(" 远端目标: ", Style::new().fg(Color::Gray)),
+                        Span::styled(format!("[{}]", self.form.remote), remote_style),
+                        Span::styled("  留空=localhost:本地端口", Style::new().fg(Color::DarkGray)),
+                    ])),
+                    line2,
+                );
+                f.render_widget(
+                    Paragraph::new(" [Tab]切换字段  [Enter]提交  [Esc]取消")
+                        .style(Style::new().fg(Color::DarkGray)),
+                    hint,
+                );
+                // 帮助栏保持可见
+                let help = format!(
+                    " [a]新增  [d]删除  [l]日志  [↑/↓]选择  [q]退出    共 {} 条隧道",
+                    self.tunnels.len()
+                );
+                f.render_widget(
+                    Paragraph::new(help).style(Style::new().fg(Color::DarkGray)),
                     footer,
                 );
             }
