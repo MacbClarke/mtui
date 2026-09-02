@@ -11,7 +11,7 @@ use russh::keys::known_hosts::check_known_hosts;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 /// SSH 会话事件处理器：负责服务器主机密钥校验（防中间人攻击）
@@ -113,7 +113,7 @@ pub(crate) struct TunnelInfo {
 /// 隧道控制中心：持有 SSH 主连接句柄 + 隧道表
 pub(crate) struct TunnelManager {
     params: ConnectParams,
-    handle: Arc<Mutex<Handle<SshHandler>>>,
+    handle: Arc<RwLock<Handle<SshHandler>>>,
     tunnels: HashMap<u16, TunnelEntry>,
     status: ConnectionStatus,
     /// 速率计算的上一采样点
@@ -125,7 +125,7 @@ pub(crate) struct TunnelManager {
 /// 单个转发连接的中继：锁内只做 channel open 并切分读写半，
 /// 随后释放锁，双向中继完全并发进行（互不阻塞），并累计字节计数。
 async fn relay(
-    session: Arc<Mutex<Handle<SshHandler>>>,
+    session: Arc<RwLock<Handle<SshHandler>>>,
     mut stream: TcpStream,
     remote_host: &str,
     remote_port: u32,
@@ -134,13 +134,14 @@ async fn relay(
     rx_bytes: Arc<AtomicU64>,
     tx_bytes: Arc<AtomicU64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (mut read_half, write_half) = {
-        let handle = session.lock().await;
-        let channel = handle
+    let channel = {
+        // 读锁可被多个连接并发持有：channel open 的确认等待不再互相阻塞
+        let handle = session.read().await;
+        handle
             .channel_open_direct_tcpip(remote_host, remote_port, originator_host, originator_port)
-            .await?;
-        channel.split()
+            .await?
     };
+    let (mut read_half, write_half) = channel.split();
     // 锁已释放：make_writer/make_reader 基于克隆的 sender/receiver，不依赖会话锁
     let mut writer = write_half.make_writer();
     let mut reader = read_half.make_reader();
@@ -183,8 +184,7 @@ async fn relay(
 /// 已建立的转发连接是独立任务，不受影响（与 ssh -O cancel 语义一致）。
 async fn listen_loop(
     listener: TcpListener,
-    handle: Arc<Mutex<Handle<SshHandler>>>,
-    local_port: u16,
+    handle: Arc<RwLock<Handle<SshHandler>>>,
     remote_host: String,
     remote_port: u32,
     connections: Arc<AtomicUsize>,
@@ -200,6 +200,7 @@ async fn listen_loop(
                 continue;
             }
         };
+        let _ = stream.set_nodelay(true);
         let handle = Arc::clone(&handle);
         let connections = Arc::clone(&connections);
         let rx_bytes = Arc::clone(&rx_bytes);
@@ -264,7 +265,7 @@ impl TunnelManager {
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         Ok(Self {
             params,
-            handle: Arc::new(Mutex::new(handle)),
+            handle: Arc::new(RwLock::new(handle)),
             tunnels: HashMap::new(),
             status: ConnectionStatus::Connected,
             last_rx: HashMap::new(),
@@ -283,7 +284,7 @@ impl TunnelManager {
         if self.status != ConnectionStatus::Connected {
             return self.status; // 重连中/已离线，交给重连流程
         }
-        let closed = self.handle.lock().await.is_closed();
+        let closed = self.handle.read().await.is_closed();
         if !closed {
             return self.status;
         }
@@ -291,7 +292,7 @@ impl TunnelManager {
             self.status = ConnectionStatus::Reconnecting(attempt);
             match Self::connect_handle(&self.params).await {
                 Ok(new_handle) => {
-                    *self.handle.lock().await = new_handle;
+                    *self.handle.write().await = new_handle;
                     self.status = ConnectionStatus::Connected;
                     return self.status;
                 }
@@ -323,7 +324,6 @@ impl TunnelManager {
         let task = tokio::spawn(listen_loop(
             listener,
             Arc::clone(&self.handle),
-            local_port,
             remote_host.to_string(),
             remote_port,
             Arc::clone(&connections),
@@ -400,7 +400,7 @@ impl TunnelManager {
         }
         let _ = self
             .handle
-            .lock()
+            .write()
             .await
             .disconnect(russh::Disconnect::ByApplication, "", "English")
             .await;
