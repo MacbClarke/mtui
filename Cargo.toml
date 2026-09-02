@@ -7,6 +7,6 @@ edition = "2024"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
 ratatui = "0.30.2"
-russh = "0.63"
+russh = { version = "0.63", default-features = false, features = ["ring", "flate2", "rsa"] }
 ssh2-config = "0.8"
 tokio = { version = "1", features = ["macros", "net", "io-util", "rt-multi-thread", "sync"] }

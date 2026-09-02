@@ -1,0 +1,34 @@
+name: build-darwin-arm64
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 与 arm64 目标
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: 编译 (release, aarch64-apple-darwin)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: 打包
+        run: |
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/mtui dist/mtui-darwin-arm64
+          cd dist && tar -czf mtui-darwin-arm64.tar.gz mtui-darwin-arm64
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtui-darwin-arm64
+          path: dist/mtui-darwin-arm64.tar.gz
+          if-no-files-found: error
