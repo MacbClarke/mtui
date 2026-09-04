@@ -428,7 +428,7 @@ pub(crate) struct TunnelManager {
 /// 单个转发连接的中继
 async fn relay(
     session: Arc<RwLock<Option<Handle<SshHandler>>>>,
-    mut stream: TcpStream,
+    stream: TcpStream,
     remote_host: &str,
     remote_port: u32,
     originator_host: &str,
@@ -445,40 +445,41 @@ async fn relay(
             .channel_open_direct_tcpip(remote_host, remote_port, originator_host, originator_port)
             .await?
     };
-    let (mut read_half, write_half) = channel.split();
-    let mut writer = write_half.make_writer();
-    let mut reader = read_half.make_reader();
 
-    let mut stream_eof = false;
-    let mut buf = vec![0u8; 65536];
-    let mut buf2 = vec![0u8; 65536];
-    loop {
-        tokio::select! {
-            r = stream.read(&mut buf), if !stream_eof => {
-                match r {
-                    Ok(0) => {
-                        stream_eof = true;
-                        writer.shutdown().await?;
-                    }
-                    Ok(n) => {
-                        tx_bytes.fetch_add(n as u64, Ordering::SeqCst);
-                        writer.write_all(&buf[..n]).await?;
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+    // channel.into_stream() 内置 ChannelCloseOnDrop，流被销毁时自动通过 tokio::spawn 发送 SSH_MSG_CHANNEL_CLOSE，彻底杜绝通道泄露
+    let channel_stream = channel.into_stream();
+    let (mut c_read, mut c_write) = tokio::io::split(channel_stream);
+    let (mut s_read, mut s_write) = stream.into_split();
+
+    let client_to_remote = async {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = s_read.read(&mut buf).await?;
+            if n == 0 {
+                let _ = c_write.shutdown().await;
+                break;
             }
-            r = reader.read(&mut buf2) => {
-                match r {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        rx_bytes.fetch_add(n as u64, Ordering::SeqCst);
-                        stream.write_all(&buf2[..n]).await?;
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
+            tx_bytes.fetch_add(n as u64, Ordering::SeqCst);
+            c_write.write_all(&buf[..n]).await?;
         }
-    }
+        Ok::<(), std::io::Error>(())
+    };
+
+    let remote_to_client = async {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = c_read.read(&mut buf).await?;
+            if n == 0 {
+                let _ = s_write.shutdown().await;
+                break;
+            }
+            rx_bytes.fetch_add(n as u64, Ordering::SeqCst);
+            s_write.write_all(&buf[..n]).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    tokio::try_join!(client_to_remote, remote_to_client)?;
     Ok(())
 }
 
@@ -531,6 +532,8 @@ impl TunnelManager {
     async fn connect_handle(params: &ConnectParams) -> Result<Handle<SshHandler>, String> {
         let config = Arc::new(client::Config {
             nodelay: true,
+            keepalive_interval: Some(Duration::from_secs(15)),
+            keepalive_max: 3,
             ..Default::default()
         });
         let mut session = client::connect(
@@ -874,6 +877,22 @@ impl TunnelManager {
         v
     }
 
+    /// 手动重新建立 SSH 连接
+    pub(crate) async fn reconnect(&mut self) -> Result<(), String> {
+        *self.status.lock().unwrap() = ConnectionStatus::Reconnecting(1);
+        match Self::connect_handle(&self.params).await {
+            Ok(new_handle) => {
+                *self.handle.write().await = Some(new_handle);
+                *self.status.lock().unwrap() = ConnectionStatus::Connected;
+                Ok(())
+            }
+            Err(e) => {
+                *self.status.lock().unwrap() = ConnectionStatus::Disconnected;
+                Err(format!("重连失败：{e}"))
+            }
+        }
+    }
+
     /// 优雅断开 SSH 主连接
     pub(crate) async fn shutdown(&mut self) {
         *self.status.lock().unwrap() = ConnectionStatus::Disconnected;
@@ -1002,6 +1021,15 @@ impl MultiTunnelManager {
         } else {
             Err(format!("主机 [{session_id}] 未找到"))
         }
+    }
+
+    pub(crate) async fn reconnect_session(&mut self, session_id: &str) -> Result<(), String> {
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.params.display_name() == session_id)
+            .ok_or_else(|| format!("主机 [{session_id}] 未找到"))?;
+        session.reconnect().await
     }
 
     pub(crate) async fn add_tunnel(
@@ -1141,6 +1169,10 @@ pub(crate) enum Command {
         session_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    ReconnectHost {
+        session_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     AddTunnel {
         session_id: String,
         local_port: u16,
@@ -1198,6 +1230,10 @@ pub(crate) async fn manager_loop(
                     }
                     Command::DisconnectHost { session_id, reply } => {
                         let r = mgr.remove_session(&session_id).await;
+                        let _ = reply.send(r);
+                    }
+                    Command::ReconnectHost { session_id, reply } => {
+                        let r = mgr.reconnect_session(&session_id).await;
                         let _ = reply.send(r);
                     }
                     Command::AddTunnel { session_id, local_port, remote_host, remote_port, reply } => {
@@ -1260,6 +1296,7 @@ pub(crate) async fn scan_remote_ports(
             None => break,
         }
     }
+    let _ = channel.close().await;
     parse_listen_ports(&String::from_utf8_lossy(&output))
 }
 

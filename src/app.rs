@@ -315,6 +315,19 @@ impl App {
                 KeyCode::Char('x') | KeyCode::Char('X') => {
                     self.disconnect_current_host();
                 }
+                // [r] 重新连接当前主机
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    if let Some(host) = self.current_host() {
+                        let session_id = host.id.clone();
+                        let (reply, rx) = oneshot::channel();
+                        self.pending_cmds.push(Command::ReconnectHost {
+                            session_id,
+                            reply,
+                        });
+                        self.pending_reply = Some((std::time::Instant::now(), rx));
+                        self.status = Some(("正在重连主机...".into(), false));
+                    }
+                }
                 // [a] 在当前主机新建隧道
                 KeyCode::Char('a') => {
                     if let Some(host) = self.current_host() {
@@ -1271,7 +1284,7 @@ impl App {
         // 5. 底栏帮助 / 日志视图
         match self.mode {
             Mode::List | Mode::ConnectHost | Mode::InputTunnel => {
-                let help = " [1-9/H/L]切换主机  [n]连接主机  [x]断开主机  [a]新建隧道  [Space/s]启停  [d]删除  [l]日志  [q]退出";
+                let help = " [1-9/H/L]切换主机  [n]连接主机  [x]断开主机  [r]重连  [a]新建隧道  [Space/s]启停  [d]删除  [l]日志  [q]退出";
                 f.render_widget(
                     Paragraph::new(help).style(Style::new().fg(Color::DarkGray)),
                     footer,
