@@ -18,6 +18,33 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
+// TCP 连接、SSH 握手及认证共用一个超时，避免断网后重连长期挂起。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// russh 会自行 spawn 会话任务；取消 connect_stream 或丢弃 Handle 并不保证
+/// 正在握手/重协商的任务退出。保留 socket 的副本，在取消或替换连接时强制关闭。
+struct SocketGuard(std::net::TcpStream);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+pub(crate) struct SshConnection {
+    handle: Handle<SshHandler>,
+    _socket: SocketGuard,
+}
+
+impl std::ops::Deref for SshConnection {
+    type Target = Handle<SshHandler>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
 /// SSH 会话事件处理器：负责服务器主机密钥校验（防中间人攻击）
 #[derive(Clone)]
 pub(crate) struct SshHandler {
@@ -414,7 +441,7 @@ pub(crate) struct RemotePort {
 /// 单个主机的隧道管理器：持有该主机的 SSH 连接句柄与所属隧道表
 pub(crate) struct TunnelManager {
     pub params: ConnectParams,
-    pub handle: Arc<RwLock<Option<Handle<SshHandler>>>>,
+    pub handle: Arc<RwLock<Option<SshConnection>>>,
     pub tunnels: HashMap<u16, TunnelEntry>,
     pub status: Arc<std::sync::Mutex<ConnectionStatus>>,
     /// 速率计算的上一采样点
@@ -423,11 +450,13 @@ pub(crate) struct TunnelManager {
     last_sample: Instant,
     /// 上次 keepalive 探测时间（闲置时维持连接活性并检测半开断链）
     last_keepalive: Instant,
+    /// 主机移除或手动重连时取消后台重试，避免旧任务再次写回连接。
+    reconnect_task: Option<JoinHandle<()>>,
 }
 
 /// 单个转发连接的中继
 async fn relay(
-    session: Arc<RwLock<Option<Handle<SshHandler>>>>,
+    session: Arc<RwLock<Option<SshConnection>>>,
     stream: TcpStream,
     remote_host: &str,
     remote_port: u32,
@@ -441,9 +470,17 @@ async fn relay(
         let Some(handle) = handle_guard.as_ref() else {
             return Err("SSH 会话未连接或已断开".into());
         };
-        handle
-            .channel_open_direct_tcpip(remote_host, remote_port, originator_host, originator_port)
-            .await?
+        tokio::time::timeout(
+            CHANNEL_OPEN_TIMEOUT,
+            handle.channel_open_direct_tcpip(
+                remote_host,
+                remote_port,
+                originator_host,
+                originator_port,
+            ),
+        )
+        .await
+        .map_err(|_| "SSH 转发通道建立超时")??
     };
 
     // channel.into_stream() 内置 ChannelCloseOnDrop，流被销毁时自动通过 tokio::spawn 发送 SSH_MSG_CHANNEL_CLOSE，彻底杜绝通道泄露
@@ -486,7 +523,7 @@ async fn relay(
 /// 隧道监听循环
 async fn listen_loop(
     listener: TcpListener,
-    handle: Arc<RwLock<Option<Handle<SshHandler>>>>,
+    handle: Arc<RwLock<Option<SshConnection>>>,
     remote_host: String,
     remote_port: u32,
     connections: Arc<AtomicUsize>,
@@ -499,6 +536,8 @@ async fn listen_loop(
             Ok(v) => v,
             Err(e) => {
                 log_push(&log, format!("accept 失败：{e}"));
+                // 例如文件描述符耗尽时 accept 会立即失败，必须等待以免忙循环。
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -529,16 +568,43 @@ async fn listen_loop(
 
 impl TunnelManager {
     /// 建立 SSH 主连接（支持公钥认证与密码认证）
-    async fn connect_handle(params: &ConnectParams) -> Result<Handle<SshHandler>, String> {
+    async fn connect_handle(params: &ConnectParams) -> Result<SshConnection, String> {
+        Self::connect_handle_with_timeout(params, CONNECT_TIMEOUT).await
+    }
+
+    async fn connect_handle_with_timeout(
+        params: &ConnectParams,
+        timeout: Duration,
+    ) -> Result<SshConnection, String> {
+        tokio::time::timeout(timeout, Self::connect_handle_inner(params))
+            .await
+            .map_err(|_| {
+                format!(
+                    "连接 {}:{} 超时（含 SSH 握手及认证）",
+                    params.host, params.ssh_port
+                )
+            })?
+    }
+
+    async fn connect_handle_inner(params: &ConnectParams) -> Result<SshConnection, String> {
         let config = Arc::new(client::Config {
             nodelay: true,
-            keepalive_interval: Some(Duration::from_secs(15)),
-            keepalive_max: 3,
+            // russh 0.63.1 的内置心跳在未认证且定时器到期时会空转。
+            // 统一由 check_and_reconnect 的 send_ping + timeout 探测活性，
+            // 避免握手卡住、或电脑休眠唤醒时触发该循环。
+            keepalive_interval: None,
             ..Default::default()
         });
-        let mut session = client::connect(
+        let stream = TcpStream::connect((params.host.as_str(), params.ssh_port))
+            .await
+            .map_err(|e| format!("连接 {}:{} 失败：{e}", params.host, params.ssh_port))?;
+        stream.set_nodelay(true).map_err(|e| e.to_string())?;
+        let stream = stream.into_std().map_err(|e| e.to_string())?;
+        let socket = SocketGuard(stream.try_clone().map_err(|e| e.to_string())?);
+        let stream = TcpStream::from_std(stream).map_err(|e| e.to_string())?;
+        let mut session = client::connect_stream(
             config,
-            (params.host.as_str(), params.ssh_port),
+            stream,
             SshHandler {
                 host: params.host.clone(),
                 port: params.ssh_port,
@@ -584,7 +650,10 @@ impl TunnelManager {
                 params.user, params.host
             ));
         }
-        Ok(session)
+        Ok(SshConnection {
+            handle: session,
+            _socket: socket,
+        })
     }
 
     /// 建立 SSH 主连接并初始化管理器
@@ -603,6 +672,7 @@ impl TunnelManager {
             last_tx: HashMap::new(),
             last_sample: Instant::now(),
             last_keepalive: Instant::now(),
+            reconnect_task: None,
         })
     }
 
@@ -620,6 +690,7 @@ impl TunnelManager {
             last_keepalive: Instant::now()
                 .checked_sub(Duration::from_secs(30))
                 .unwrap_or_else(Instant::now),
+            reconnect_task: None,
         }
     }
 
@@ -686,11 +757,14 @@ impl TunnelManager {
         if !closed {
             return now;
         }
+        // 先关闭失效 transport，使旧会话及转发任务能退出，不再占用资源。
+        self.handle.write().await.take();
+        self.cancel_reconnect().await;
         *self.status.lock().unwrap() = ConnectionStatus::Reconnecting(0);
         let params = self.params.clone();
         let handle = Arc::clone(&self.handle);
         let status = Arc::clone(&self.status);
-        tokio::spawn(async move {
+        self.reconnect_task = Some(tokio::spawn(async move {
             for attempt in 1..=5 {
                 *status.lock().unwrap() = ConnectionStatus::Reconnecting(attempt);
                 match TunnelManager::connect_handle(&params).await {
@@ -706,7 +780,7 @@ impl TunnelManager {
                 }
             }
             *status.lock().unwrap() = ConnectionStatus::Disconnected;
-        });
+        }));
         ConnectionStatus::Reconnecting(0)
     }
 
@@ -879,6 +953,8 @@ impl TunnelManager {
 
     /// 手动重新建立 SSH 连接
     pub(crate) async fn reconnect(&mut self) -> Result<(), String> {
+        self.cancel_reconnect().await;
+        self.handle.write().await.take();
         *self.status.lock().unwrap() = ConnectionStatus::Reconnecting(1);
         match Self::connect_handle(&self.params).await {
             Ok(new_handle) => {
@@ -893,8 +969,16 @@ impl TunnelManager {
         }
     }
 
+    async fn cancel_reconnect(&mut self) {
+        if let Some(task) = self.reconnect_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     /// 优雅断开 SSH 主连接
     pub(crate) async fn shutdown(&mut self) {
+        self.cancel_reconnect().await;
         *self.status.lock().unwrap() = ConnectionStatus::Disconnected;
         for (_port, entry) in self.tunnels.drain() {
             if let Some(task) = entry.task {
@@ -902,9 +986,11 @@ impl TunnelManager {
             }
         }
         if let Some(handle) = self.handle.write().await.take() {
-            let _ = handle
-                .disconnect(russh::Disconnect::ByApplication, "", "English")
-                .await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                handle.disconnect(russh::Disconnect::ByApplication, "", "English"),
+            )
+            .await;
         }
     }
 }
@@ -1269,9 +1355,13 @@ pub(crate) async fn manager_loop(
 // ---------- 远端端口发现 ----------
 
 /// 在远端执行 `ss -tln`（fallback: netstat -tln），解析监听端口列表。
-pub(crate) async fn scan_remote_ports(
-    handle: &RwLock<Option<Handle<SshHandler>>>,
-) -> Vec<RemotePort> {
+pub(crate) async fn scan_remote_ports(handle: &RwLock<Option<SshConnection>>) -> Vec<RemotePort> {
+    tokio::time::timeout(CHANNEL_OPEN_TIMEOUT, scan_remote_ports_inner(handle))
+        .await
+        .unwrap_or_default()
+}
+
+async fn scan_remote_ports_inner(handle: &RwLock<Option<SshConnection>>) -> Vec<RemotePort> {
     let mut channel = {
         let h_guard = handle.read().await;
         let Some(h) = h_guard.as_ref() else {
@@ -1357,6 +1447,196 @@ fn extract_process(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_params(port: u16) -> ConnectParams {
+        ConnectParams {
+            alias: None,
+            user: "test".into(),
+            host: "127.0.0.1".into(),
+            ssh_port: port,
+            auth: AuthMethod::Password("test".into()),
+            check_host_key: false,
+        }
+    }
+
+    /// 模拟 TCP 已连通，但 SSH banner 或密钥交换停止响应。
+    async fn stalled_peer(
+        send_banner: bool,
+    ) -> (ConnectParams, JoinHandle<()>, Arc<tokio::sync::Notify>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let params = test_params(listener.local_addr().unwrap().port());
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let signal = ready.clone();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            if send_banner {
+                stream.write_all(b"SSH-2.0-stalled-test\r\n").await.unwrap();
+            }
+            signal.notify_one();
+            // 必须在客户端超时/取消后收到 EOF，而非仅丢弃外层 future。
+            let mut data = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut data))
+                .await
+                .expect("超时后底层 TCP 连接仍未关闭")
+                .unwrap();
+        });
+        (params, task, ready)
+    }
+
+    #[tokio::test]
+    async fn stalled_banner_times_out_and_closes_socket() {
+        let (params, peer, _) = stalled_peer(false).await;
+        let result =
+            TunnelManager::connect_handle_with_timeout(&params, Duration::from_millis(100)).await;
+        assert!(matches!(result, Err(e) if e.contains("超时")));
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_key_exchange_times_out_and_closes_spawned_session() {
+        let (params, peer, _) = stalled_peer(true).await;
+        let result =
+            TunnelManager::connect_handle_with_timeout(&params, Duration::from_millis(100)).await;
+        assert!(matches!(result, Err(e) if e.contains("超时")));
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_pending_reconnect_and_closes_socket() {
+        let (params, peer, ready) = stalled_peer(true).await;
+        let mut manager = TunnelManager::new_disconnected(params);
+        assert!(matches!(
+            manager.check_and_reconnect().await,
+            ConnectionStatus::Reconnecting(_)
+        ));
+        // 确保重连已接通 TCP，而不是尚未开始就取消。
+        tokio::time::timeout(Duration::from_secs(1), ready.notified())
+            .await
+            .unwrap();
+        manager.shutdown().await;
+        peer.await.unwrap();
+        assert!(manager.reconnect_task.is_none());
+        assert!(manager.handle.read().await.is_none());
+        assert!(matches!(manager.status(), ConnectionStatus::Disconnected));
+    }
+
+    struct TestSshd {
+        auth_started: Arc<tokio::sync::Notify>,
+        auth_release: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl russh::server::Handler for TestSshd {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _: &str,
+            _: &str,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            self.auth_started.notify_one();
+            if let Some(release) = &self.auth_release {
+                release.notified().await;
+            }
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            _: &str,
+            _: u32,
+            _: &str,
+            _: u32,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            tokio::spawn(async move {
+                let mut stream = channel.into_stream();
+                let mut buf = [0; 1024];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Ok(())
+        }
+    }
+
+    async fn test_sshd(handler: TestSshd) -> (ConnectParams, JoinHandle<()>) {
+        use russh::keys::ssh_key::private::Ed25519Keypair;
+        let config = Arc::new(russh::server::Config {
+            // 固定种子仅用于本地测试，不读取用户私钥。
+            keys: vec![Ed25519Keypair::from_seed(&[42; 32]).into()],
+            ..Default::default()
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let params = test_params(listener.local_addr().unwrap().port());
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let session = russh::server::run_stream(config, stream, handler)
+                .await
+                .unwrap();
+            let _ = session.await;
+        });
+        (params, task)
+    }
+
+    #[tokio::test]
+    async fn stalled_authentication_times_out_and_closes_session() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (params, peer) = test_sshd(TestSshd {
+            auth_started: started.clone(),
+            auth_release: Some(release.clone()),
+        })
+        .await;
+        let client = tokio::spawn(async move {
+            TunnelManager::connect_handle_with_timeout(&params, Duration::from_secs(1)).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        assert!(matches!(client.await.unwrap(), Err(e) if e.contains("超时")));
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_connection_can_forward_and_drop_closes_session() {
+        let (params, peer) = test_sshd(TestSshd {
+            auth_started: Arc::new(tokio::sync::Notify::new()),
+            auth_release: None,
+        })
+        .await;
+        let connection = TunnelManager::connect_handle(&params).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), connection.send_ping())
+            .await
+            .unwrap()
+            .unwrap();
+        let channel = connection
+            .channel_open_direct_tcpip("localhost", 80, "127.0.0.1", 0)
+            .await
+            .unwrap();
+        let mut stream = channel.into_stream();
+        stream.write_all(b"still works").await.unwrap();
+        let mut reply = [0; 11];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"still works");
+        // 即使仍有 SSH 通道引用，丢弃连接也必须关闭 transport。
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn parse_ss_output() {
